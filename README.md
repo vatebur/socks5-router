@@ -157,6 +157,8 @@ curl --proxy socks5h://203.0.113.10:21080 \
 
 选择 `6. 升级`，或执行 `sudo socks5-router upgrade`。升级器从 GitHub 下载最新稳定版安装包与 SHA256SUMS，校验后检查新版本能否读取现有配置、是否通过当前 Xray 核心检查，以及生成的运行配置是否一致。通过后更新管理脚本与 JSON 模板，保留配置、凭据、端口及服务运行状态；完成后使用 `socks5-router` 呼出新版菜单。
 
+升级只跟随 GitHub Releases 已发布的稳定版，不跟随 `main` 分支提交。修复代码提交后，需要发布更高版本的安装包和 SHA256SUMS，才能通过升级菜单获取。
+
 相同版本提示已是最新版，较低版本不会覆盖当前版本；下载、校验、兼容检查失败时不修改安装文件，文件安装失败时恢复原管理脚本。
 
 从 v0.2.0 / v0.3.0 升级到本版，先运行一键安装命令即可更新管理脚本，保留已有配置。从 v0.1.0 升级时，先备份 `/etc/socks5-router/state.json`，使用旧版本菜单卸载，再安装新版本。
@@ -216,6 +218,14 @@ bash scripts/build_release.sh
 ```bash
 bash socks5.sh render --state examples/server-a.json --output /tmp/socks5-xray.json
 /absolute/path/to/xray run -test -config /tmp/socks5-xray.json
+```
+
+安装、卸载和升级的回归检查使用临时目录，并模拟 systemd 和系统账号操作，不修改本机服务或账号：
+
+```bash
+bash tests/install_lifecycle.sh /absolute/path/to/Xray-linux-64.zip
+bash tests/uninstall_lifecycle.sh
+bash tests/upgrade_lifecycle.sh /absolute/path/to/xray
 ```
 
 功能参考：[mack-a/v2ray-agent](https://github.com/mack-a/v2ray-agent)。核心配置参考 Xray 官方 [SOCKS 入站](https://xtls.github.io/config/inbounds/socks.html)、[SOCKS 出站](https://xtls.github.io/config/outbounds/socks.html)、[路由](https://xtls.github.io/config/routing.html)。

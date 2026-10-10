@@ -617,9 +617,10 @@ uninstall_service() {
         error '无法检查 systemd 服务状态，卸载未完成。'; return 1;
     }
     if [[ -f $UNIT_FILE || ( -n $load_state && $load_state != not-found ) ]]; then
-        if ! { service_ctl stop "$SERVICE" && service_ctl disable "$SERVICE" && service_ctl reset-failed "$SERVICE"; }; then
+        if ! { service_ctl stop "$SERVICE" && service_ctl disable "$SERVICE"; }; then
             error '无法停止或禁用服务，卸载未完成。'; return 1
         fi
+        reset_failed_service || { error '无法清理服务失败状态，卸载未完成。'; return 1; }
     fi
     if uid=$(id -u "$ACCOUNT" 2>/dev/null); then
         (( uid != 0 )) || { error '专用服务账号意外指向 root，卸载未完成。'; return 1; }
@@ -782,11 +783,16 @@ upgrade_manager() {
     UPGRADE_COMPLETED=0
     stage=$(mktemp -d /tmp/socks5-router-upgrade.XXXXXX) || return 1
     CURRENT_STAGE=$stage
-    if ! download_release "$stage"; then rm -rf -- "$stage"; CURRENT_STAGE=; return 1; fi
+    if ! download_release "$stage"; then
+        rm -rf -- "$stage"; CURRENT_STAGE=
+        error '下载或校验最新发行版失败，未修改现有管理脚本。'; return 1
+    fi
     candidate="$stage/socks5-router"
     latest=$(bash "$candidate/socks5.sh" --version) || { rm -rf -- "$stage"; CURRENT_STAGE=; return 1; }
     if ! version_newer "$latest" "$VERSION"; then
-        if [[ $latest == "$VERSION" ]]; then success "已是最新版本：$VERSION";
+        if [[ $latest == "$VERSION" ]]; then
+            success "已是最新版本：$VERSION"
+            hint '升级仅跟随已发布的稳定版；未发布的修复不会出现在升级菜单中。'
         elif [[ $latest =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$ ]]; then hint "当前版本 $VERSION 高于稳定发行版 $latest，无需升级。";
         else rm -rf -- "$stage"; CURRENT_STAGE=; error '发行包版本号无效。'; return 1; fi
         rm -rf -- "$stage"; CURRENT_STAGE=; return 0
