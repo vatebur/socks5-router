@@ -6,3 +6,4 @@
 *.tar.gz
 *.zip
 SHA256SUMS
+tests/

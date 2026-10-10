@@ -26,7 +26,7 @@ socks5_installer=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/vateb
 
 ```bash
 sha256sum -c SHA256SUMS
-tar -xzf socks5-router-v0.4.0.tar.gz
+tar -xzf socks5-router-v0.4.1.tar.gz
 cd socks5-router
 sudo bash socks5.sh
 ```
@@ -36,7 +36,7 @@ sudo bash socks5.sh
 - 使用 systemd 的 Linux 服务器；x86_64 / amd64 或 aarch64 / arm64。
 - Bash 4+、jq 1.6+、curl、unzip、iproute / iproute2、util-linux、coreutils 和 CA 证书。
 - 安装与维护需要 root；离线校验和生成 JSON 可使用普通用户。
-- 系统依赖支持通过 apt、dnf、yum 安装；Xray 固定为 [v26.3.27](https://github.com/XTLS/Xray-core/releases/tag/v26.3.27)，使用内置 SHA256 校验。
+- 系统依赖支持通过 apt、dnf、yum 安装；Xray 跟随[官方 Latest 稳定版](https://github.com/XTLS/Xray-core/releases/latest)，使用官方发布的 SHA256 校验，拒绝草稿和预发布版。
 
 ## 依赖检查与下载
 
@@ -157,6 +157,8 @@ curl --proxy socks5h://203.0.113.10:21080 \
 
 选择 `6. 升级`，或执行 `sudo socks5-router upgrade`。升级器从 GitHub 下载最新稳定版安装包与 SHA256SUMS，校验后检查新版本能否读取现有配置、是否通过当前 Xray 核心检查，以及生成的运行配置是否一致。通过后更新管理脚本与 JSON 模板，保留配置、凭据、端口及服务运行状态；完成后使用 `socks5-router` 呼出新版菜单。
 
+v0.4.1 起，升级还会检查 Xray 官方 Latest，即使管理脚本已是最新版也会更新较旧的核心。新核心先通过现有配置检查；服务原先运行时才重启，原先停止时继续保持停止，开机启动设置不变。核心启动失败时恢复旧核心和运行状态；管理脚本已更新而核心更新失败时会明确提示，可重新执行升级。旧版升级器只更新管理脚本，从 v0.4.0 或更早版本升级后，再执行一次 `sudo socks5-router upgrade` 即可检查 Latest 核心。
+
 升级只跟随 GitHub Releases 已发布的稳定版，不跟随 `main` 分支提交。修复代码提交后，需要发布更高版本的安装包和 SHA256SUMS，才能通过升级菜单获取。
 
 相同版本提示已是最新版，较低版本不会覆盖当前版本；下载、校验、兼容检查失败时不修改安装文件，文件安装失败时恢复原管理脚本。
@@ -196,13 +198,14 @@ bash socks5.sh render --state examples/server-a.json --output /tmp/xray.json
 
 ## 离线核心安装
 
-从 [Xray 官方 Release](https://github.com/XTLS/Xray-core/releases/tag/v26.3.27) 下载 `Xray-linux-64.zip` 或 `Xray-linux-arm64-v8a.zip`，再运行：
+从 [Xray 官方 Latest](https://github.com/XTLS/Xray-core/releases/latest) 下载 `Xray-linux-64.zip` 或 `Xray-linux-arm64-v8a.zip`。只提供 ZIP 时仍会联网查询 Latest 并验证 SHA256；完全离线时，还需事先保存相同版本的官方元数据：
 
 ```bash
-sudo bash socks5.sh --xray-archive /path/Xray-linux-64.zip
+curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest -o xray-release.json
+sudo bash socks5.sh --xray-archive /path/Xray-linux-64.zip --xray-release /path/xray-release.json
 ```
 
-仍会验证固定 SHA256。系统依赖需提前准备或通过软件源安装。
+离线安装按元数据快照选择版本和校验值；请同时保存对应的 ZIP。GitHub 元数据缺少 SHA256 时，脚本会读取官方 `.dgst` 校验文件，因此该情形仍需要联网。系统依赖需提前准备或通过软件源安装。
 
 ## 开发检查与发布打包
 
@@ -218,14 +221,6 @@ bash scripts/build_release.sh
 ```bash
 bash socks5.sh render --state examples/server-a.json --output /tmp/socks5-xray.json
 /absolute/path/to/xray run -test -config /tmp/socks5-xray.json
-```
-
-安装、卸载和升级的回归检查使用临时目录，并模拟 systemd 和系统账号操作，不修改本机服务或账号：
-
-```bash
-bash tests/install_lifecycle.sh /absolute/path/to/Xray-linux-64.zip
-bash tests/uninstall_lifecycle.sh
-bash tests/upgrade_lifecycle.sh /absolute/path/to/xray
 ```
 
 功能参考：[mack-a/v2ray-agent](https://github.com/mack-a/v2ray-agent)。核心配置参考 Xray 官方 [SOCKS 入站](https://xtls.github.io/config/inbounds/socks.html)、[SOCKS 出站](https://xtls.github.io/config/outbounds/socks.html)、[路由](https://xtls.github.io/config/routing.html)。
