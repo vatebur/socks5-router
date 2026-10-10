@@ -29,7 +29,7 @@ dependency_ready() {
         unzip) unzip -v >/dev/null 2>&1;;
         ss) ss -V >/dev/null 2>&1;;
         awk) awk 'BEGIN {exit 0}' </dev/null >/dev/null 2>&1;;
-        useradd|getent) "$tool" --help >/dev/null 2>&1;;
+        useradd|userdel|groupdel|getent) "$tool" --help >/dev/null 2>&1;;
         *) "$tool" --version >/dev/null 2>&1;;
     esac
 }
@@ -53,7 +53,7 @@ dependency_package() {
         ss) if [[ $DEPENDENCY_MANAGER == apt-get ]]; then printf 'iproute2\n'; else printf 'iproute\n'; fi;;
         flock) printf 'util-linux\n';;
         awk) printf 'gawk\n';;
-        useradd) if [[ $DEPENDENCY_MANAGER == apt-get ]]; then printf 'passwd\n'; else printf 'shadow-utils\n'; fi;;
+        useradd|userdel|groupdel) if [[ $DEPENDENCY_MANAGER == apt-get ]]; then printf 'passwd\n'; else printf 'shadow-utils\n'; fi;;
         getent) if [[ $DEPENDENCY_MANAGER == apt-get ]]; then printf 'libc-bin\n'; else printf 'glibc-common\n'; fi;;
         sha256sum|timeout|od|dd|install|stat|mktemp) printf 'coreutils\n';;
         *) installer_error "未知依赖：$1"; return 1;;
@@ -138,6 +138,31 @@ verify_package() {
     [[ ${actual%% *} == "${expected,,}" ]] || { installer_error '安装包 SHA256 不匹配。'; return 1; }
 }
 
+download_release() {
+    local stage=$1
+    local metadata name package_url checksum_url
+    curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \
+        "https://api.github.com/repos/$REPOSITORY/releases/latest" -o "$stage/release.json" || return 1
+    metadata=$(release_metadata "$stage/release.json") || return 1
+    IFS=$'\t' read -r name package_url checksum_url <<< "$metadata"
+    printf '正在下载 %s……\n' "$name" >&2
+    curl -fSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 300 --retry 2 \
+        "$package_url" -o "$stage/package.tar.gz" || return 1
+    curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \
+        "$checksum_url" -o "$stage/SHA256SUMS" || return 1
+    verify_package "$stage/package.tar.gz" "$stage/SHA256SUMS" "$name" || return 1
+    tar -tzf "$stage/package.tar.gz" > "$stage/files" || return 1
+    if ! awk '/^\// || /(^|\/)\.\.(\/|$)/ || !/^socks5-router\// {bad=1} END {exit bad}' "$stage/files"; then
+        installer_error '安装包目录结构无效。'; return 1
+    fi
+    tar --no-same-owner --no-same-permissions -xzf "$stage/package.tar.gz" -C "$stage" || return 1
+    [[ -f $stage/socks5-router/socks5.sh && -f $stage/socks5-router/install.sh &&
+       -f $stage/socks5-router/lib/config.sh && -f $stage/socks5-router/templates/xray.json &&
+       -f $stage/socks5-router/templates/render.jq ]] || {
+        installer_error '最新发行版尚未包含 Bash 版本，请先发布 v0.2.0 或更新版本。'; return 1;
+    }
+}
+
 installer_main() {
     if [[ ${1:-} == --help ]]; then
         printf '%s\n' '用法：sudo bash install.sh [socks5.sh 的选项]' '下载 GitHub 最新稳定版安装包，校验 SHA256 后打开中文菜单。'
@@ -148,26 +173,7 @@ installer_main() {
     umask 077
     INSTALL_STAGE=$(mktemp -d /tmp/socks5-router-install.XXXXXX) || return 1
     trap 'rm -rf -- "$INSTALL_STAGE"' EXIT
-    local metadata name package_url checksum_url
-    curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \
-        "https://api.github.com/repos/$REPOSITORY/releases/latest" -o "$INSTALL_STAGE/release.json" || return 1
-    metadata=$(release_metadata "$INSTALL_STAGE/release.json") || return 1
-    IFS=$'\t' read -r name package_url checksum_url <<< "$metadata"
-    printf '正在下载 %s……\n' "$name" >&2
-    curl -fSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 300 --retry 2 \
-        "$package_url" -o "$INSTALL_STAGE/package.tar.gz" || return 1
-    curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \
-        "$checksum_url" -o "$INSTALL_STAGE/SHA256SUMS" || return 1
-    verify_package "$INSTALL_STAGE/package.tar.gz" "$INSTALL_STAGE/SHA256SUMS" "$name" || return 1
-    tar -tzf "$INSTALL_STAGE/package.tar.gz" > "$INSTALL_STAGE/files" || return 1
-    if ! awk '/^\// || /(^|\/)\.\.(\/|$)/ || !/^socks5-router\// {bad=1} END {exit bad}' "$INSTALL_STAGE/files"; then
-        installer_error '安装包目录结构无效。'; return 1
-    fi
-    tar --no-same-owner --no-same-permissions -xzf "$INSTALL_STAGE/package.tar.gz" -C "$INSTALL_STAGE" || return 1
-    [[ -f $INSTALL_STAGE/socks5-router/install.sh && -f $INSTALL_STAGE/socks5-router/lib/config.sh &&
-       -f $INSTALL_STAGE/socks5-router/templates/render.jq ]] || {
-        installer_error '最新发行版尚未包含 Bash 版本，请先发布 v0.2.0 或更新版本。'; return 1;
-    }
+    download_release "$INSTALL_STAGE" || return 1
     if [[ -t 0 ]]; then bash "$INSTALL_STAGE/socks5-router/socks5.sh" "$@";
     elif [[ -r /dev/tty ]]; then bash "$INSTALL_STAGE/socks5-router/socks5.sh" "$@" </dev/tty;
     else installer_error '交互安装需要终端，请下载后通过 SSH 终端运行。'; fi

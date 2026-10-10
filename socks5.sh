@@ -8,7 +8,7 @@ RESOURCE_DIR=$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
 source "$RESOURCE_DIR/lib/config.sh"
 source "$RESOURCE_DIR/install.sh"
 
-VERSION=0.3.0
+VERSION=0.4.0
 XRAY_VERSION=v26.3.27
 SERVICE=socks5-router.service
 ACCOUNT=socks5-router
@@ -17,14 +17,16 @@ BASE="$ROOT_PREFIX/etc/socks5-router"
 LIB="$ROOT_PREFIX/usr/local/lib/socks5-router"
 STATE_FILE="$BASE/state.json"
 CONFIG_FILE="$BASE/config.json"
-PREVIOUS_FILE="$BASE/previous.json"
 XRAY="$LIB/xray"
 UNIT_FILE="$ROOT_PREFIX/etc/systemd/system/$SERVICE"
 COMMAND_FILE="$ROOT_PREFIX/usr/local/bin/socks5-router"
+LOCK_FILE="$ROOT_PREFIX/run/socks5-router.lock"
 CONFIG_GROUP=${SOCKS5_CONFIG_GROUP:-$ACCOUNT}
 CURRENT_STAGE=
 APPLY_CANCELLED=0
 FORM_STATE=
+UPGRADE_COMPLETED=0
+UNINSTALL_COMPLETED=0
 
 require_root() { (( EUID == 0 )) || { error '此操作需要 root，请使用 sudo bash socks5.sh。'; return 1; }; }
 service_ctl() { systemctl "$@"; }
@@ -32,9 +34,22 @@ service_active() { service_ctl is-active --quiet "$SERVICE"; }
 
 require_state() {
     [[ -f $STATE_FILE ]] || {
-        say '尚未配置 SOCKS5 入站，请先选择「1. SOCKS5 部署」→「1. SOCKS5 入站」完成配置。'
+        say '尚未配置 SOCKS5，请先选择「1. SOCKS5 部署」安装入站或出站。'
         return 1
     }
+}
+
+inbound_installed() { [[ -f $STATE_FILE ]] && jq -e '.schema==1 or .inbound_enabled==true' "$STATE_FILE" >/dev/null; }
+outbound_installed() { [[ -f $STATE_FILE ]] && jq -e '.upstream!=null' "$STATE_FILE" >/dev/null; }
+
+require_inbound() {
+    require_state || return 1
+    inbound_installed || { say '尚未安装 SOCKS5 入站，请先通过部署菜单安装入站。'; return 1; }
+}
+
+require_outbound() {
+    require_state || return 1
+    outbound_installed || { say '尚未安装 SOCKS5 出站，请先通过部署菜单安装出站及分流。'; return 1; }
 }
 
 require_runtime() {
@@ -47,7 +62,7 @@ require_runtime() {
 ensure_jq() { ensure_tools jq; }
 
 ensure_dependencies() {
-    ensure_tools jq curl unzip tar ss flock timeout sha256sum od dd install stat useradd getent ca-certificates
+    ensure_tools jq curl unzip tar ss flock timeout sha256sum od dd install stat useradd userdel groupdel getent ca-certificates
 }
 
 prepare_dirs() {
@@ -75,7 +90,10 @@ install_manager() {
     local wrapper
     wrapper=$(mktemp "$(dirname -- "$COMMAND_FILE")/.socks5-router.XXXXXX") || return 1
     printf '#!/usr/bin/env bash\nexec bash /usr/local/lib/socks5-router/socks5.sh "$@"\n' > "$wrapper" || { rm -f -- "$wrapper"; return 1; }
-    chmod 755 "$wrapper" && mv -f -- "$wrapper" "$COMMAND_FILE"
+    if ! { chmod 755 "$wrapper" && mv -f -- "$wrapper" "$COMMAND_FILE"; }; then
+        rm -f -- "$wrapper"; return 1
+    fi
+    rm -f -- "$BASE/previous.json"
 }
 
 install_core() {
@@ -147,7 +165,7 @@ UNIT
 
 atomic_install() {
     local source=$1 target=$2 mode=$3 group=${4:-root} temporary
-    temporary=$(mktemp "$(dirname -- "$target")/.new.XXXXXX") || return 1
+    temporary=$(mktemp "$(dirname -- "$target")/.socks5-router.new.XXXXXX") || return 1
     if install -m "$mode" -g "$group" -- "$source" "$temporary" && mv -f -- "$temporary" "$target"; then return 0; fi
     rm -f -- "$temporary"; return 1
 }
@@ -167,7 +185,7 @@ wait_started() {
 
 snapshot_files() {
     local stage=$1 index=0 target
-    for target in "$STATE_FILE" "$CONFIG_FILE" "$UNIT_FILE" "$PREVIOUS_FILE"; do
+    for target in "$STATE_FILE" "$CONFIG_FILE" "$UNIT_FILE"; do
         if [[ -f $target ]]; then cp -p -- "$target" "$stage/backup.$index" || return 1; fi
         index=$((index+1))
     done
@@ -175,9 +193,9 @@ snapshot_files() {
 
 restore_files() {
     local stage=$1 index=0 target temporary failed=0
-    for target in "$STATE_FILE" "$CONFIG_FILE" "$UNIT_FILE" "$PREVIOUS_FILE"; do
+    for target in "$STATE_FILE" "$CONFIG_FILE" "$UNIT_FILE"; do
         if [[ -f $stage/backup.$index ]]; then
-            temporary=$(mktemp "$(dirname -- "$target")/.restore.XXXXXX") || { failed=1; index=$((index+1)); continue; }
+            temporary=$(mktemp "$(dirname -- "$target")/.socks5-router.restore.XXXXXX") || { failed=1; index=$((index+1)); continue; }
             if ! { cp -p -- "$stage/backup.$index" "$temporary" && mv -f -- "$temporary" "$target"; }; then
                 rm -f -- "$temporary"; failed=1
             fi
@@ -194,11 +212,10 @@ apply_commit() {
     atomic_install "$stage/config.json" "$CONFIG_FILE" 640 "$CONFIG_GROUP" || return 1
     atomic_install "$stage/unit" "$UNIT_FILE" 644 || return 1
     service_ctl daemon-reload || return 1
-    service_ctl enable "$SERVICE" || return 1
     service_ctl reset-failed "$SERVICE" || return 1
-    service_ctl restart "$SERVICE" || return 1
-    wait_started || return 1
-    if [[ -f $stage/backup.0 ]]; then atomic_install "$stage/backup.0" "$PREVIOUS_FILE" 600 || return 1; fi
+    if jq -e '.inbound_enabled' "$stage/state.json" >/dev/null; then
+        service_ctl enable "$SERVICE" && service_ctl restart "$SERVICE" && wait_started || return 1
+    else service_ctl disable "$SERVICE" && service_ctl stop "$SERVICE" || return 1; fi
 }
 
 apply_rollback() {
@@ -209,6 +226,10 @@ apply_rollback() {
     fi
     restore_files "$stage" || failed=1
     service_ctl daemon-reload || failed=1
+    if [[ -f $UNIT_FILE ]]; then
+        if (( was_enabled )); then service_ctl enable "$SERVICE" || failed=1;
+        else service_ctl disable "$SERVICE" || failed=1; fi
+    fi
     if (( failed == 0 && was_active )); then
         service_ctl reset-failed "$SERVICE" || failed=1
         if (( failed == 0 )); then
@@ -223,21 +244,22 @@ apply_rollback() {
 }
 
 apply_state() {
-    local source=$1 force_probe=${2:-0} stage normalized old_port='' port was_active=0 was_enabled=0 result=0
+    local source=$1 force_probe=${2:-0} stage normalized old_port=0 port=0 enabled was_active=0 was_enabled=0 result=0
     normalized=$(normalize_state "$source") || return 1
     stage=$(mktemp -d "$BASE/.transaction.XXXXXX") || return 1
     CURRENT_STAGE=$stage
     printf '%s\n' "$normalized" > "$stage/state.json" || { rm -rf -- "$stage"; CURRENT_STAGE=; return 1; }
     if ! render_config "$stage/state.json" > "$stage/config.json"; then rm -rf -- "$stage"; CURRENT_STAGE=; return 1; fi
     if ! "$XRAY" run -test -config "$stage/config.json"; then rm -rf -- "$stage"; CURRENT_STAGE=; return 1; fi
-    if (( force_probe )) || [[ $(jq -r '.mode' "$stage/state.json") != direct ]]; then
+    enabled=$(jq -r '.inbound_enabled' "$stage/state.json")
+    if (( force_probe )) || [[ $enabled == true && $(jq -r '.mode' "$stage/state.json") != direct ]]; then
         if ! verify_upstream "$stage/state.json"; then rm -rf -- "$stage"; CURRENT_STAGE=; return 1; fi
     fi
     service_active && was_active=1
     service_ctl is-enabled --quiet "$SERVICE" && was_enabled=1
-    [[ ! -f $STATE_FILE ]] || old_port=$(jq -r '.port' "$STATE_FILE")
-    port=$(jq -r '.port' "$stage/state.json")
-    if ! (( was_active && port == old_port )); then
+    [[ ! -f $STATE_FILE ]] || old_port=$(jq -r '.port // 0' "$STATE_FILE")
+    port=$(jq -r '.port // 0' "$stage/state.json")
+    if [[ $enabled == true ]] && ! (( was_active && port == old_port )); then
         if ! port_free "$port"; then rm -rf -- "$stage"; CURRENT_STAGE=; error '监听端口已占用或查询失败。'; return 1; fi
     fi
     render_unit > "$stage/unit" || { rm -rf -- "$stage"; CURRENT_STAGE=; return 1; }
@@ -248,7 +270,9 @@ apply_state() {
         trap 'exit 130' INT TERM
         rm -rf -- "$stage"; CURRENT_STAGE=; return 1
     fi
-    if apply_commit "$stage"; then say '配置已生效，服务已设置为开机启动。'
+    if apply_commit "$stage"; then
+        if [[ $enabled == true ]]; then say '配置已生效，服务已设置为开机启动。';
+        else say '配置已保存；未安装入站，服务保持停止并关闭开机启动。'; fi
     else
         result=1
         APPLY_CANCELLED=0
@@ -266,7 +290,8 @@ deploy() {
     [[ $(uname -s) == Linux && -d /run/systemd/system ]] || { error '需要使用 systemd 的 Linux 服务器。'; return 1; }
     normalize_state "$state" >/dev/null || return 1
     ensure_dependencies && prepare_dirs && install_core "$archive" && install_manager || return 1
-    apply_state "$state"
+    if jq -e '.upstream!=null' "$state" >/dev/null; then apply_state "$state" 1;
+    else apply_state "$state"; fi
 }
 
 show_state() {
@@ -282,10 +307,12 @@ check_state() {
     expected=$(render_config "$STATE_FILE" | jq -cS .) || return 1
     if actual=$(jq -cS . "$CONFIG_FILE") && [[ $expected == "$actual" ]]; then
         say '[通过] 状态文件、入站、出站、分流和来源 IP 路由规则。'
-    else error 'state.json 与 config.json 无法读取或不一致，请重新应用配置。'; failed=1; fi
+    else error 'state.json 与 config.json 无法读取或不一致，请通过修改配置菜单修正。'; failed=1; fi
     "$XRAY" run -test -config "$CONFIG_FILE" || failed=1
-    if service_active; then say '[通过] systemd 服务运行中。'
-    else error '服务当前未运行。'; failed=1; fi
+    if inbound_installed; then
+        if service_active; then say '[通过] systemd 服务运行中。'
+        else error '服务当前未运行。'; failed=1; fi
+    else say '[提示] 未安装入站，服务保持停止。'; fi
     if [[ $(jq -r '.mode' "$STATE_FILE") != direct ]]; then
         if verify_upstream "$STATE_FILE"; then say '[通过] 上游接受当前账号密码。'
         else failed=1; fi
@@ -299,7 +326,7 @@ diagnostics() {
     say '=== 配置检查与上游认证 ==='
     check_state || failed=1
     say '=== 服务状态 ==='
-    service_ctl status --no-pager "$SERVICE" || failed=1
+    if ! service_ctl status --no-pager "$SERVICE"; then inbound_installed && failed=1; fi
     say '=== 最近 40 条日志 ==='
     journalctl -u "$SERVICE" -n 40 --no-pager || failed=1
     return "$failed"
@@ -307,7 +334,7 @@ diagnostics() {
 
 restart_service() {
     local expected actual
-    require_runtime || return 1
+    require_inbound && require_runtime || return 1
     expected=$(render_config "$STATE_FILE" | jq -cS .) || return 1
     actual=$(jq -cS . "$CONFIG_FILE") || return 1
     [[ $expected == "$actual" ]] || { error '配置与状态不一致，请重新应用。'; return 1; }
@@ -466,9 +493,8 @@ ask_mode() {
 }
 
 form_new() {
-    FORM_STATE=$(jq -n '{schema:1,role:"B",listen:"0.0.0.0",port:null,
+    FORM_STATE=$(jq -n '{schema:2,role:"B",inbound_enabled:false,listen:"0.0.0.0",port:null,
         username:"",password:"",whitelist:[],mode:"direct",domains:[],upstream:null}') || return 1
-    ask_credentials && ask_listener && ask_whitelist || return 1
 }
 
 submit_form() {
@@ -482,47 +508,99 @@ submit_form() {
 }
 
 connection_info() {
-    jq -r '"SOCKS5 入站：" + (if .listen|contains(":") then "["+.listen+"]" else .listen end) + ":" + (.port|tostring),
-        "入站用户名："+.username, "入站密码："+.password, "分流模式："+.mode' "$STATE_FILE"
-    say '将本机的可达地址、入站端口和账号填入其他机器的 SOCKS5 出站，即可作为其上游。'
-    say '请放行云安全组及现有主机防火墙的 TCP 端口；域名分流使用 socks5h / 远程 DNS。'
+    normalize_state "$STATE_FILE" | jq -r '
+        if .inbound_enabled then
+          "SOCKS5 入站：" + (if .listen|contains(":") then "["+.listen+"]" else .listen end) + ":" + (.port|tostring),
+          "入站用户名："+.username, "入站密码："+.password
+        else "SOCKS5 入站：未安装" end,
+        (if .upstream==null then "SOCKS5 出站：未安装" else "SOCKS5 出站："+.upstream.host+":"+(.upstream.port|tostring) end),
+        "分流模式："+.mode'
+    if inbound_installed; then
+        say '将本机的可达地址、入站端口和账号填入其他机器的 SOCKS5 出站，即可作为其上游。'
+        say '请放行云安全组及现有主机防火墙的 TCP 端口；域名分流使用 socks5h / 远程 DNS。'
+    fi
     say '使用 socks5-router 呼出菜单（普通用户使用 sudo socks5-router）。'
 }
 
-edit_form() {
-    local selected force_probe=0
-    require_runtime || return 1
+edit_inbound() {
+    local selected
+    require_inbound && require_runtime || return 1
     FORM_STATE=$(normalize_state "$STATE_FILE") || return 1
-    say $'1. 入站账号密码\n2. 监听端口\n3. 来源 IP 白名单\n4. 上游连接信息\n5. 域名列表\n6. 分流模式'
-    ask '选择修改项（0 返回）' 0 || return 1
+    say $'1. 入站账号密码\n2. 监听端口\n3. 来源 IP 白名单\n0. 返回'
+    ask '选择入站修改项' 0 || return 1
     selected=$REPLY
     case $selected in
         0) return 0;; 1) ask_credentials || return 1;; 2) ask_listener || return 1;; 3) ask_whitelist || return 1;;
-        4)
-            if [[ $(jq -r '.upstream==null' <<< "$FORM_STATE") == true ]]; then
-                say '尚未配置 SOCKS5 出站，将继续选择分流模式并填写上游。'
-                ask_mode 1 || return 1
-            else ask_upstream || return 1; force_probe=1; fi;;
-        5)
+        *) error '无效选项。'; return 1;;
+    esac
+    submit_form apply_form 0
+}
+
+edit_outbound() {
+    local selected force_probe=0
+    require_outbound && require_runtime || return 1
+    FORM_STATE=$(normalize_state "$STATE_FILE") || return 1
+    say $'1. 上游连接信息\n2. 域名列表\n3. 分流模式\n0. 返回'
+    ask '选择出站修改项' 0 || return 1
+    selected=$REPLY
+    case $selected in
+        0) return 0;; 1) ask_upstream || return 1; force_probe=1;;
+        2)
             [[ $(jq -r '.mode' <<< "$FORM_STATE") == domain ]] || {
                 say '域名列表仅用于按域名分流，请先配置出站并选择按域名分流模式。'; return 1;
             }
             ask_domains || return 1;;
-        6) ask_mode || return 1;; *) error '无效选项。'; return 1;;
+        3) ask_mode || return 1;; *) error '无效选项。'; return 1;;
     esac
     submit_form apply_form "$force_probe"
 }
 
+edit_menu() {
+    while :; do
+        say $'\n修改配置\n1. 修改 SOCKS5 入站配置\n2. 修改 SOCKS5 出站配置\n0. 返回'
+        ask '请选择' '' || return 0
+        case $REPLY in
+            0) return 0;; 1) edit_inbound || say '入站修改未完成。';;
+            2) edit_outbound || say '出站修改未完成。';; *) error '无效选项。';;
+        esac
+    done
+}
+
 uninstall_service() {
-    require_state || return 1
-    say '将删除本工具的服务、配置、凭据备份和安装目录。'
+    local load_state uid gid directory
+    UNINSTALL_COMPLETED=0
+    say '将彻底删除 SOCKS5 服务、核心、管理脚本、全部配置及专用系统账号和用户组。'
     ask '输入 DELETE 确认卸载' '' || return 1
     [[ $REPLY == DELETE ]] || { say '已取消。'; return 0; }
-    service_ctl stop "$SERVICE" && service_ctl disable "$SERVICE" || return 1
-    rm -f -- "$UNIT_FILE" "$COMMAND_FILE" || return 1
+    load_state=$(service_ctl show --property=LoadState --value "$SERVICE") || {
+        error '无法检查 systemd 服务状态，卸载未完成。'; return 1;
+    }
+    if [[ -f $UNIT_FILE || ( -n $load_state && $load_state != not-found ) ]]; then
+        if ! { service_ctl stop "$SERVICE" && service_ctl disable "$SERVICE" && service_ctl reset-failed "$SERVICE"; }; then
+            error '无法停止或禁用服务，卸载未完成。'; return 1
+        fi
+    fi
+    if uid=$(id -u "$ACCOUNT" 2>/dev/null); then
+        (( uid != 0 )) || { error '专用服务账号意外指向 root，卸载未完成。'; return 1; }
+        userdel "$ACCOUNT" || { error '专用系统账号删除失败，卸载未完成。'; return 1; }
+    fi
+    if gid=$(getent group "$ACCOUNT"); then
+        IFS=: read -r _ _ gid _ <<< "$gid"
+        [[ $gid != 0 ]] || { error '专用用户组意外指向 root，卸载未完成。'; return 1; }
+        groupdel "$ACCOUNT" || { error '专用用户组删除失败，卸载未完成。'; return 1; }
+    fi
+    for directory in "$ROOT_PREFIX/etc/systemd/system" "$ROOT_PREFIX/run/systemd/system"; do
+        rm -f -- "$directory/$SERVICE" "$directory"/*.wants/"$SERVICE" \
+            "$directory"/*.requires/"$SERVICE" "$directory"/*.upholds/"$SERVICE" \
+            "$directory"/.socks5-router.* || return 1
+        rm -rf -- "$directory/$SERVICE.d" || return 1
+    done
+    rm -f -- "$UNIT_FILE" "$COMMAND_FILE" "$(dirname -- "$COMMAND_FILE")"/.socks5-router.* || return 1
     rm -rf -- "$BASE" "$LIB" || return 1
     service_ctl daemon-reload || return 1
-    say '已卸载；专用无登录系统账号保留，可按需手动删除。'
+    rm -f -- "$LOCK_FILE" || return 1
+    UNINSTALL_COMPLETED=1
+    say '已彻底卸载：服务、程序、配置、锁文件及专用系统账号和用户组均已清理。'
 }
 
 deploy_form() {
@@ -538,45 +616,61 @@ apply_form() {
 }
 
 configure_inbound() {
+    if inbound_installed; then say '入站已安装，请通过「修改配置」→「修改 SOCKS5 入站配置」进行修改。'; return 0; fi
     if [[ -f $STATE_FILE ]]; then
         require_runtime || return 1
         FORM_STATE=$(normalize_state "$STATE_FILE") || return 1
-        ask_credentials && ask_listener && ask_whitelist || return 1
-        submit_form apply_form 0
     else
         [[ ! -f $UNIT_FILE ]] || { error '存在服务文件但缺少状态配置，请检查安装目录。'; return 1; }
-        form_new && submit_form deploy_form
+        form_new || return 1
     fi
+    form_json inbound_enabled true || return 1
+    ask_credentials && ask_listener && ask_whitelist || return 1
+    if [[ -f $STATE_FILE ]]; then submit_form apply_form 0; else submit_form deploy_form; fi
 }
 
 configure_outbound() {
-    require_runtime || return 1
+    if outbound_installed; then say '出站已安装，请通过「修改配置」→「修改 SOCKS5 出站配置」进行修改。'; return 0; fi
+    if [[ -f $STATE_FILE ]]; then
+        require_runtime || return 1
+        FORM_STATE=$(normalize_state "$STATE_FILE") || return 1
+    else form_new || return 1; fi
+    ask_mode 1 || return 1
+    [[ $(jq -r '.upstream!=null' <<< "$FORM_STATE") == true ]] || { say '选择了全部直连，未安装 SOCKS5 出站。'; return 0; }
+    if [[ -f $STATE_FILE ]]; then submit_form apply_form 1; else submit_form deploy_form; fi
+}
+
+remove_inbound() {
+    require_inbound && require_runtime || return 1
+    ask '卸载 SOCKS5 入站并清除监听账号？y/n' n || return 1
+    [[ $REPLY == y || $REPLY == Y ]] || { say '已取消。'; return 0; }
     FORM_STATE=$(normalize_state "$STATE_FILE") || return 1
-    ask_mode 1 && submit_form apply_form 0
+    FORM_STATE=$(jq '.inbound_enabled=false|.port=null|.username=""|.password=""|.whitelist=[]' <<< "$FORM_STATE") || return 1
+    submit_form apply_form 0
+}
+
+remove_outbound() {
+    require_outbound && require_runtime || return 1
+    ask '卸载 SOCKS5 出站及分流？y/n' n || return 1
+    [[ $REPLY == y || $REPLY == Y ]] || { say '已取消。'; return 0; }
+    FORM_STATE=$(normalize_state "$STATE_FILE") || return 1
+    FORM_STATE=$(jq '.upstream=null|.domains=[]|.mode="direct"|.role="B"' <<< "$FORM_STATE") || return 1
+    submit_form apply_form 0
 }
 
 deployment_menu() {
     while :; do
-        say $'\nSOCKS5 部署\n1. SOCKS5 入站（部署 / 修改）\n2. SOCKS5 出站及分流（配置 / 修改 / 恢复直连）\n0. 返回'
+        say $'\nSOCKS5 部署\n1. 安装 SOCKS5 入站\n2. 安装 SOCKS5 出站及分流\n3. 卸载 SOCKS5 入站\n4. 卸载 SOCKS5 出站及分流\n0. 返回'
         ask '请选择' '' || return 0
         case $REPLY in
             0) return 0;;
             1) configure_inbound || say '入站配置未完成。';;
-            2) require_state || continue; configure_outbound || say '出站配置未完成。';;
+            2) configure_outbound || say '出站配置未完成。';;
+            3) remove_inbound || say '入站卸载未完成。';;
+            4) remove_outbound || say '出站卸载未完成。';;
             *) error '无效选项。';;
         esac
     done
-}
-
-restore_previous() {
-    require_runtime || return 1
-    [[ -f $PREVIOUS_FILE ]] || { say '暂无上一版配置，成功修改配置后才能恢复。'; return 1; }
-    apply_state "$PREVIOUS_FILE" && connection_info
-}
-
-reapply_current() {
-    require_runtime || return 1
-    apply_state "$STATE_FILE" && connection_info
 }
 
 stop_service() {
@@ -584,21 +678,99 @@ stop_service() {
     service_ctl stop "$SERVICE" && say '服务已停止，开机启动设置保留。'
 }
 
+service_menu() {
+    while :; do
+        say $'\n服务管理\n1. 启动/重启服务\n2. 停止服务\n0. 返回'
+        ask '请选择' '' || return 0
+        case $REPLY in 0) return 0;; 1) restart_service || :;; 2) stop_service || :;; *) error '无效选项。';; esac
+    done
+}
+
+version_newer() {
+    local candidate=$1 current=$2 a b c x y z
+    [[ $candidate =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$ &&
+       $current =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$ ]] || return 1
+    IFS=. read -r a b c <<< "$candidate"
+    IFS=. read -r x y z <<< "$current"
+    (( 10#$a > 10#$x || (10#$a == 10#$x && 10#$b > 10#$y) ||
+        (10#$a == 10#$x && 10#$b == 10#$y && 10#$c > 10#$z) ))
+}
+
+replace_manager() {
+    local candidate=$1 stage=$2 index=0 target temporary failed=0 original_resource=$RESOURCE_DIR
+    local -a targets=("$LIB/socks5.sh" "$LIB/install.sh" "$LIB/lib/config.sh"
+        "$LIB/templates/xray.json" "$LIB/templates/render.jq" "$COMMAND_FILE")
+    for target in "${targets[@]}"; do
+        if [[ -f $target ]]; then cp -p -- "$target" "$stage/manager.$index" || return 1; fi
+        index=$((index+1))
+    done
+    install -d -m 755 "$LIB" "$(dirname -- "$COMMAND_FILE")" || return 1
+    RESOURCE_DIR=$candidate
+    if ! install_manager; then failed=1; fi
+    RESOURCE_DIR=$original_resource
+    (( failed )) || return 0
+    index=0
+    for target in "${targets[@]}"; do
+        if [[ -f $stage/manager.$index ]]; then
+            temporary=$(mktemp "$(dirname -- "$target")/.socks5-router.upgrade-restore.XXXXXX") || return 1
+            cp -p -- "$stage/manager.$index" "$temporary" && mv -f -- "$temporary" "$target" || return 1
+        else rm -f -- "$target" || return 1; fi
+        index=$((index+1))
+    done
+    error '升级安装失败，已恢复原管理脚本。'; return 1
+}
+
+upgrade_manager() {
+    local stage candidate latest expected actual rc=0
+    UPGRADE_COMPLETED=0
+    stage=$(mktemp -d /tmp/socks5-router-upgrade.XXXXXX) || return 1
+    CURRENT_STAGE=$stage
+    if ! download_release "$stage"; then rm -rf -- "$stage"; CURRENT_STAGE=; return 1; fi
+    candidate="$stage/socks5-router"
+    latest=$(bash "$candidate/socks5.sh" --version) || { rm -rf -- "$stage"; CURRENT_STAGE=; return 1; }
+    if ! version_newer "$latest" "$VERSION"; then
+        if [[ $latest == "$VERSION" ]]; then say "已是最新版本：$VERSION";
+        elif [[ $latest =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$ ]]; then say "当前版本 $VERSION 高于稳定发行版 $latest，无需升级。";
+        else rm -rf -- "$stage"; CURRENT_STAGE=; error '发行包版本号无效。'; return 1; fi
+        rm -rf -- "$stage"; CURRENT_STAGE=; return 0
+    fi
+    say "准备升级：$VERSION → $latest"
+    if [[ -f $STATE_FILE ]]; then
+        if ! bash "$candidate/socks5.sh" render --state "$STATE_FILE" --output "$stage/config.json"; then
+            rm -rf -- "$stage"; CURRENT_STAGE=; error '新版本无法读取当前配置，未升级。'; return 1
+        fi
+        if [[ ! -x $XRAY ]] || ! "$XRAY" run -test -config "$stage/config.json"; then
+            rm -rf -- "$stage"; CURRENT_STAGE=; error '新配置未通过现有 Xray 核心检查，未升级。'; return 1
+        fi
+        if ! expected=$(jq -cS . "$stage/config.json") || ! actual=$(jq -cS . "$CONFIG_FILE") || [[ $expected != "$actual" ]]; then
+            rm -rf -- "$stage"; CURRENT_STAGE=; error '新版本与当前运行配置不兼容，未升级。'; return 1
+        fi
+    fi
+    replace_manager "$candidate" "$stage" || rc=$?
+    rm -rf -- "$stage"; CURRENT_STAGE=
+    if (( rc == 0 )); then
+        UPGRADE_COMPLETED=1
+        say "已升级到 $latest，当前配置和服务运行状态保留。"
+        say '使用 socks5-router 呼出新版菜单（普通用户使用 sudo socks5-router）。'
+    fi
+    return "$rc"
+}
+
 menu() {
     while :; do
         say $'\n轻量 SOCKS5 管理（Bash / TCP CONNECT）'
         say $'1. SOCKS5 部署（入站 / 出站）\n2. 查看配置及账号密码\n3. 检查配置、上游认证、状态和日志'
-        say $'4. 修改配置\n5. 启动/重启\n6. 停止服务\n7. 恢复上一次配置\n8. 重新应用配置\n9. 卸载\n0. 退出'
+        say $'4. 修改配置\n5. 服务管理\n6. 升级\n7. 卸载全部\n0. 退出'
         say '使用 socks5-router 呼出菜单（普通用户使用 sudo socks5-router）。'
         ask '请选择' '' || return 0
-        case $REPLY in 2|3|4|5|6|7|8|9) require_state || continue;; esac
+        case $REPLY in 2|3|4|5) require_state || continue;; esac
         case $REPLY in
             0) return 0;;
             1) deployment_menu;;
             2) show_state || :;; 3) diagnostics || :;;
-            4) edit_form || say '修改未完成。';; 5) restart_service || :;;
-            6) stop_service || :;; 7) restore_previous || :;; 8) reapply_current || :;;
-            9) if uninstall_service && [[ ! -f $STATE_FILE ]]; then return 0; fi;;
+            4) edit_menu;; 5) service_menu;;
+            6) upgrade_manager || say '升级未完成。'; (( UPGRADE_COMPLETED == 0 )) || return 0;;
+            7) uninstall_service || say '卸载未完成，请检查上述错误后重试。'; (( UNINSTALL_COMPLETED == 0 )) || return 0;;
             *) error '无效选项。';;
         esac
     done
@@ -606,7 +778,7 @@ menu() {
 
 usage() {
     cat <<'HELP'
-用法：bash socks5.sh [menu|validate|render|check|show] [选项]
+用法：bash socks5.sh [menu|validate|render|check|show|upgrade] [选项]
   --state FILE         validate/render 所用状态 JSON
   --output FILE        render 输出文件，包含凭据，权限 600
   --xray-archive FILE  部署时使用离线官方 Xray ZIP（仍校验 SHA256）
@@ -622,7 +794,7 @@ main() {
     OFFLINE_ARCHIVE=
     while (( $# )); do
         case $1 in
-            menu|validate|render|check|show|_probe) action=$1; shift;;
+            menu|validate|render|check|show|upgrade|_probe) action=$1; shift;;
             --state|--output|--xray-archive)
                 (( $# >= 2 )) || { error '选项缺少参数。'; return 1; }
                 case $1 in --state) state=$2;; --output) output=$2;; --xray-archive) OFFLINE_ARCHIVE=$2;; esac
@@ -648,13 +820,13 @@ main() {
     if [[ $action == check || $action == show ]]; then require_state || return 1; fi
     ensure_dependencies || return 1
     command -v flock >/dev/null || { error '请先安装 util-linux（flock）。'; return 1; }
-    exec 200>"$ROOT_PREFIX/run/socks5-router.lock" || return 1
+    exec 200>"$LOCK_FILE" || return 1
     flock -n 200 || { error '已有另一管理进程运行。'; return 1; }
     umask 077
     trap '[[ -z $CURRENT_STAGE ]] || rm -rf -- "$CURRENT_STAGE"' EXIT
     trap 'exit 130' INT TERM
     if [[ $action == menu && -f $STATE_FILE && $RESOURCE_DIR != "$LIB" ]]; then install_manager || return 1; fi
-    case $action in check) diagnostics;; show) show_state;; *) menu;; esac
+    case $action in check) diagnostics;; show) show_state;; upgrade) upgrade_manager;; *) menu;; esac
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

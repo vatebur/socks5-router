@@ -21,3 +21,4 @@ $template[0] |
   (if $limited then [{type:"field", inboundTag:["socks-in"], outboundTag:"blocked"}] else [] end)
 ) |
 .outbounds += (if $limited then [{tag:"blocked", protocol:"blackhole", settings:{}}] else [] end)
+| if $state.inbound_enabled then . else .inbounds=[] | .routing.rules=[] end

@@ -191,15 +191,18 @@ valid_credential() {
 normalize_state() {
     local file=$1 state listen host value domains='' whitelist='' result
     state=$(jq -cse 'if length==1 then .[0] else error("JSON 必须只有一个对象") end |
+      if .schema==1 then .schema=2|.inbound_enabled=true else . end |
       def account: type=="string" and utf8bytelength>=1 and utf8bytelength<=255 and
         (explode | all(.[]; .>=32 and (. <127 or .>159)));
       def port: type=="number" and floor==. and .>=1 and .<=65535;
       def text: type=="string" and (explode | all(.[]; .>=32 and (. <127 or .>159)));
       def strings: type=="array" and all(.[];text);
-      if type=="object" and keys==(["schema","role","listen","port","username","password",
+      if type=="object" and keys==(["schema","role","inbound_enabled","listen","port","username","password",
         "whitelist","mode","domains","upstream"]|sort) and
-        .schema==1 and (.role=="A" or .role=="B") and (.listen|text) and
-        (.port|port) and (.username|account) and (.password|account) and
+        .schema==2 and (.role=="A" or .role=="B") and (.listen|text) and
+        (.inbound_enabled|type=="boolean") and
+        (if .inbound_enabled then (.port|port) and (.username|account) and (.password|account)
+         else .port==null and .username=="" and .password=="" and .whitelist==[] end) and
         (.whitelist|strings) and (.domains|strings) and
         (.mode=="direct" or .mode=="domain" or .mode=="global") and
         (.upstream==null or (.upstream|type=="object" and keys==(["host","port","username","password"]|sort)
