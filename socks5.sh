@@ -32,6 +32,15 @@ require_root() { (( EUID == 0 )) || { error '此操作需要 root，请使用 su
 service_ctl() { systemctl "$@"; }
 service_active() { service_ctl is-active --quiet "$SERVICE"; }
 
+reset_failed_service() {
+    # A newly written unit may not be loaded yet. Only failed units need their
+    # failure state/start limit cleared; restart will load a fresh unit itself.
+    if service_ctl is-failed --quiet "$SERVICE"; then
+        service_ctl reset-failed "$SERVICE" || return 1
+    fi
+    return 0
+}
+
 require_state() {
     [[ -f $STATE_FILE ]] || {
         say '尚未配置 SOCKS5，请先选择「1. SOCKS5 部署」安装入站或出站。'
@@ -212,9 +221,9 @@ apply_commit() {
     atomic_install "$stage/config.json" "$CONFIG_FILE" 640 "$CONFIG_GROUP" || return 1
     atomic_install "$stage/unit" "$UNIT_FILE" 644 || return 1
     service_ctl daemon-reload || return 1
-    service_ctl reset-failed "$SERVICE" || return 1
     if jq -e '.inbound_enabled' "$stage/state.json" >/dev/null; then
-        service_ctl enable "$SERVICE" && service_ctl restart "$SERVICE" && wait_started || return 1
+        service_ctl enable "$SERVICE" && reset_failed_service && \
+            service_ctl restart "$SERVICE" && wait_started || return 1
     else service_ctl disable "$SERVICE" && service_ctl stop "$SERVICE" || return 1; fi
 }
 
@@ -231,7 +240,7 @@ apply_rollback() {
         else service_ctl disable "$SERVICE" || failed=1; fi
     fi
     if (( failed == 0 && was_active )); then
-        service_ctl reset-failed "$SERVICE" || failed=1
+        reset_failed_service || failed=1
         if (( failed == 0 )); then
             service_ctl restart "$SERVICE" && wait_started || failed=1
         fi
@@ -341,7 +350,7 @@ restart_service() {
     expected=$(render_config "$STATE_FILE" | jq -cS .) || return 1
     actual=$(jq -cS . "$CONFIG_FILE") || return 1
     [[ $expected == "$actual" ]] || { error '配置与状态不一致，请重新应用。'; return 1; }
-    "$XRAY" run -test -config "$CONFIG_FILE" && service_ctl reset-failed "$SERVICE" && \
+    "$XRAY" run -test -config "$CONFIG_FILE" && reset_failed_service && \
         service_ctl restart "$SERVICE" && wait_started
 }
 

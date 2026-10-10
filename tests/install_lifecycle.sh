@@ -24,20 +24,40 @@ prepare_dirs() {
     install -d -m 750 "$BASE"
     install -d -m 755 "$LIB" "$(dirname -- "$UNIT_FILE")"
 }
-RUNNING=0 ENABLED=0
+RUNNING=0 ENABLED=0 LOADED=0 FAILED=0 RESET_CALLS=0 FAIL_RESET=0
 service_ctl() {
     case $1 in
         is-active) (( RUNNING ));;
         is-enabled) (( ENABLED ));;
-        restart) RUNNING=1;;
+        is-failed) (( LOADED )) || return 4; (( FAILED ));;
+        reset-failed)
+            RESET_CALLS=$((RESET_CALLS+1))
+            (( LOADED )) || { printf 'Unit socks5-router.service not loaded.\n' >&2; return 1; }
+            (( ! FAIL_RESET )) || return 1
+            FAILED=0;;
+        restart) LOADED=1; RUNNING=1;;
         stop) RUNNING=0;;
-        enable) ENABLED=1;;
+        enable) LOADED=1; ENABLED=1;;
         disable) ENABLED=0;;
         *) return 0;;
     esac
 }
 wait_started() { (( RUNNING )); }
 port_free() { return 0; }
+
+reset_failed_service
+[[ $RESET_CALLS == 0 ]]
+LOADED=1 FAILED=1
+reset_failed_service
+[[ $RESET_CALLS == 1 && $FAILED == 0 ]]
+FAILED=1 FAIL_RESET=1
+if reset_failed_service; then
+    printf 'FAIL a reset error was ignored\n' >&2
+    exit 1
+fi
+[[ $RESET_CALLS == 2 && $FAILED == 1 ]]
+LOADED=0 FAILED=0 RESET_CALLS=0 FAIL_RESET=0
+printf 'PASS unloaded units skip reset; failed units reset; reset errors propagate\n'
 
 (
     main menu <<< 0 > "$TEST_STAGE/menu.log" 2>&1
@@ -63,10 +83,18 @@ printf '%s\n' "$FORM_STATE" > "$TEST_STAGE/inbound.json"
 printf 'PASS core installation failure retains the menu command and reports its stage\n'
 
 if [[ -n ${1:-} ]]; then
-    deploy "$TEST_STAGE/inbound.json" "$1" > "$TEST_STAGE/deploy.log" 2>&1
-    [[ $RUNNING == 1 && $ENABLED == 1 ]]
+    deploy "$TEST_STAGE/inbound.json" "$1" > "$TEST_STAGE/deploy.log" 2>&1 || {
+        cat "$TEST_STAGE/deploy.log" >&2
+        exit 1
+    }
+    [[ $RUNNING == 1 && $ENABLED == 1 && $RESET_CALLS == 0 ]]
     jq -e '.inbound_enabled and .port==21080' "$STATE_FILE" >/dev/null
     "$XRAY" run -test -config "$CONFIG_FILE" > "$TEST_STAGE/xray.log" 2>&1
     [[ $(stat -c %a "$STATE_FILE") == 600 && $(stat -c %a "$CONFIG_FILE") == 640 ]]
-    printf 'PASS fresh inbound deployment with verified offline core and real Xray validation\n'
+    printf 'PASS fresh inbound deployment when systemd has not loaded the unit\n'
+
+    RUNNING=0 FAILED=1
+    restart_service > "$TEST_STAGE/restart.log" 2>&1
+    [[ $RUNNING == 1 && $FAILED == 0 && $RESET_CALLS == 1 ]]
+    printf 'PASS a previously failed service clears its failure before restart\n'
 fi
