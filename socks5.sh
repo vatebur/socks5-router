@@ -8,7 +8,7 @@ RESOURCE_DIR=$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
 source "$RESOURCE_DIR/lib/config.sh"
 source "$RESOURCE_DIR/install.sh"
 
-VERSION=0.2.0
+VERSION=0.3.0
 XRAY_VERSION=v26.3.27
 SERVICE=socks5-router.service
 ACCOUNT=socks5-router
@@ -29,6 +29,20 @@ FORM_STATE=
 require_root() { (( EUID == 0 )) || { error '此操作需要 root，请使用 sudo bash socks5.sh。'; return 1; }; }
 service_ctl() { systemctl "$@"; }
 service_active() { service_ctl is-active --quiet "$SERVICE"; }
+
+require_state() {
+    [[ -f $STATE_FILE ]] || {
+        say '尚未配置 SOCKS5 入站，请先选择「1. SOCKS5 部署」→「1. SOCKS5 入站」完成配置。'
+        return 1
+    }
+}
+
+require_runtime() {
+    require_state || return 1
+    [[ -f $CONFIG_FILE && -f $UNIT_FILE && -x $XRAY ]] || {
+        error '运行配置、服务文件或 Xray 核心不完整，请检查安装目录。'; return 1;
+    }
+}
 
 ensure_jq() { ensure_tools jq; }
 
@@ -256,29 +270,44 @@ deploy() {
 }
 
 show_state() {
-    local reveal=${1:-0} normalized
+    local normalized
+    require_state || return 1
     normalized=$(normalize_state "$STATE_FILE") || return 1
-    if (( reveal )); then jq . <<< "$normalized";
-    else jq '.password="********"|if .upstream!=null then .upstream.password="********" else . end' <<< "$normalized"; fi
+    jq . <<< "$normalized"
 }
 
 check_state() {
-    local expected actual
+    local expected actual failed=0
+    require_runtime || return 1
     expected=$(render_config "$STATE_FILE" | jq -cS .) || return 1
-    actual=$(jq -cS . "$CONFIG_FILE") || return 1
-    [[ $expected == "$actual" ]] || { error 'state.json 与 config.json 不一致，请重新应用配置。'; return 1; }
-    "$XRAY" run -test -config "$CONFIG_FILE" || return 1
-    say '[通过] 状态文件、入站、出站、分流和来源 IP 路由规则。'
-    service_active || { error '配置正确，但服务当前未运行。'; return 1; }
-    say '[通过] systemd 服务运行中。'
+    if actual=$(jq -cS . "$CONFIG_FILE") && [[ $expected == "$actual" ]]; then
+        say '[通过] 状态文件、入站、出站、分流和来源 IP 路由规则。'
+    else error 'state.json 与 config.json 无法读取或不一致，请重新应用配置。'; failed=1; fi
+    "$XRAY" run -test -config "$CONFIG_FILE" || failed=1
+    if service_active; then say '[通过] systemd 服务运行中。'
+    else error '服务当前未运行。'; failed=1; fi
     if [[ $(jq -r '.mode' "$STATE_FILE") != direct ]]; then
-        verify_upstream "$STATE_FILE" || return 1
-        say '[通过] B 接受当前账号密码。'
+        if verify_upstream "$STATE_FILE"; then say '[通过] 上游接受当前账号密码。'
+        else failed=1; fi
     fi
+    return "$failed"
+}
+
+diagnostics() {
+    local failed=0
+    require_state || return 1
+    say '=== 配置检查与上游认证 ==='
+    check_state || failed=1
+    say '=== 服务状态 ==='
+    service_ctl status --no-pager "$SERVICE" || failed=1
+    say '=== 最近 40 条日志 ==='
+    journalctl -u "$SERVICE" -n 40 --no-pager || failed=1
+    return "$failed"
 }
 
 restart_service() {
     local expected actual
+    require_runtime || return 1
     expected=$(render_config "$STATE_FILE" | jq -cS .) || return 1
     actual=$(jq -cS . "$CONFIG_FILE") || return 1
     [[ $expected == "$actual" ]] || { error '配置与状态不一致，请重新应用。'; return 1; }
@@ -306,29 +335,43 @@ ask_credentials() {
     while :; do
         ask '用户名（auto 自动生成 UUID）' "${old:-auto}" || return 1
         value=$REPLY
-        [[ $value != auto ]] || value=$(new_uuid) || return 1
+        if [[ $value == auto ]]; then
+            value=$(new_uuid) || return 1
+            say "自动生成的用户名：$value"
+        fi
         if valid_credential "$value"; then form_set username "$value" || return 1; break; fi
     done
     old=$(jq -r '.password // ""' <<< "$FORM_STATE")
     while :; do
         ask '密码（回车保留已有值，无已有值或输入 auto 时生成 UUID）' "$old" 1 || return 1
         value=$REPLY
-        [[ -n $value && $value != auto ]] || value=$(new_uuid) || return 1
+        if [[ -z $value || $value == auto ]]; then
+            value=$(new_uuid) || return 1
+            say "自动生成的密码：$value"
+        fi
         if valid_credential "$value"; then form_set password "$value" || return 1; break; fi
     done
 }
 
+wildcard_listener() {
+    local disabled=1
+    if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]]; then
+        read -r disabled < /proc/sys/net/ipv6/conf/all/disable_ipv6 || disabled=1
+    fi
+    if [[ $disabled == 0 ]]; then printf '::\n'; else printf '0.0.0.0\n'; fi
+}
+
 ask_listener() {
     local old value
-    old=$(jq -r '.listen // "0.0.0.0"' <<< "$FORM_STATE")
-    while :; do
-        ask '监听 IP（0.0.0.0 / :: 为通配，系统支持时双栈）' "$old" || return 1
-        if value=$(normalize_ip "$REPLY"); then form_set listen "$value" || return 1; break; fi
-    done
+    value=$(wildcard_listener) || return 1
+    form_set listen "$value" || return 1
+    say "监听地址：$value（通配地址）"
     old=$(jq -r '.port // "auto"' <<< "$FORM_STATE")
     while :; do
         ask '监听端口（auto 自动选择空闲端口）' "$old" || return 1
-        if [[ $REPLY == auto ]]; then value=$(choose_port) || return 1;
+        if [[ $REPLY == auto ]]; then
+            value=$(choose_port) || return 1
+            say "自动选择的监听端口：$value"
         elif ! value=$(parse_port "$REPLY"); then continue; fi
         form_json port "$value" || return 1
         break
@@ -339,7 +382,7 @@ ask_list() {
     local key=$1 type=$2 old text value normalized list failed
     old=$(jq -r --arg key "$key" '.[$key]|join(" ")' <<< "$FORM_STATE")
     while :; do
-        ask "$([[ $type == domain ]] && printf '通过 B 访问的域名' || printf '可信来源 IP / CIDR')" "$old" || return 1
+        ask "$([[ $type == domain ]] && printf '通过上游访问的域名' || printf '可信来源 IP / CIDR')" "$old" || return 1
         text=${REPLY//,/ }; text=${text//;/ }; text=${text//，/ }; text=${text//；/ }
         list=; failed=0
         # Whitespace splitting is intentional; pathname expansion stays disabled.
@@ -374,16 +417,16 @@ ask_whitelist() {
 ask_upstream() {
     local upstream old key value
     upstream=$(jq '.upstream // {}' <<< "$FORM_STATE") || return 1
-    say '请填写 B 的实际连接信息；上游账号不会自动生成。'
+    say '请填写上游 SOCKS5 的实际连接信息；上游账号不会自动生成。'
     for key in host port username password; do
         old=$(jq -r --arg key "$key" '.[$key] // ""' <<< "$upstream") || return 1
         while :; do
             case $key in
-                host) ask 'B 地址（可达 IP 或域名）' "$old" || return 1
+                host) ask '上游地址（可达 IP 或域名）' "$old" || return 1
                       value=$(normalize_host "$REPLY") || continue;;
-                port) ask 'B 端口' "$old" || return 1; value=$(parse_port "$REPLY") || continue;;
-                username) ask 'B 的实际用户名' "$old" || return 1; value=$REPLY; valid_credential "$value" || continue;;
-                password) ask 'B 的实际密码（已有值时回车保留）' "$old" 1 || return 1
+                port) ask '上游端口' "$old" || return 1; value=$(parse_port "$REPLY") || continue;;
+                username) ask '上游的实际用户名' "$old" || return 1; value=$REPLY; valid_credential "$value" || continue;;
+                password) ask '上游的实际密码（已有值时回车保留）' "$old" 1 || return 1
                           value=$REPLY; valid_credential "$value" || continue;;
             esac
             if [[ $key == port ]]; then upstream=$(jq --argjson value "$value" '.port=$value' <<< "$upstream") || return 1;
@@ -400,24 +443,32 @@ ask_domains() {
 }
 
 ask_mode() {
-    local default=1 mode
+    local configure_upstream=${1:-0} default=1 mode
     case $(jq -r '.mode' <<< "$FORM_STATE") in direct) default=2;; global) default=3;; esac
-    say '1. 按域名分流   2. 跳过分流（全部直连）   3. 全局代理（全部通过 B）'
+    say '1. 按域名分流   2. 跳过分流（全部直连）   3. 全局代理（全部通过上游）'
     while :; do
         ask '分流模式' "$default" || return 1
         case $REPLY in 1) mode=domain;; 2) mode=direct;; 3) mode=global;; *) error '请选择 1/2/3。'; continue;; esac
         form_set mode "$mode" || return 1
         break
     done
-    if [[ $mode != direct && $(jq -r '.upstream==null' <<< "$FORM_STATE") == true ]]; then ask_upstream || return 1; fi
-    [[ $mode != domain ]] || ask_domains
+    if [[ $mode == direct ]]; then
+        form_json upstream null && form_json domains '[]' && form_set role B || return 1
+    else
+        form_set role A || return 1
+        if (( configure_upstream )) || [[ $(jq -r '.upstream==null' <<< "$FORM_STATE") == true ]]; then
+            ask_upstream || return 1
+        fi
+        if [[ $mode == domain ]]; then ask_domains || return 1;
+        else form_json domains '[]' || return 1; fi
+    fi
+    return 0
 }
 
 form_new() {
-    FORM_STATE=$(jq -n --arg role "$1" '{schema:1,role:$role,listen:"0.0.0.0",port:null,
+    FORM_STATE=$(jq -n '{schema:1,role:"B",listen:"0.0.0.0",port:null,
         username:"",password:"",whitelist:[],mode:"direct",domains:[],upstream:null}') || return 1
     ask_credentials && ask_listener && ask_whitelist || return 1
-    if [[ $1 == A ]]; then form_set mode domain && ask_mode || return 1; fi
 }
 
 submit_form() {
@@ -431,35 +482,39 @@ submit_form() {
 }
 
 connection_info() {
-    jq -r '"角色：\(.role)；监听：\(.listen):\(.port)；用户名：\(.username)"' "$STATE_FILE"
-    say '密码可通过菜单 4 显示。B 的地址、端口和实际账号需同步填入 A。'
+    jq -r '"SOCKS5 入站：" + (if .listen|contains(":") then "["+.listen+"]" else .listen end) + ":" + (.port|tostring),
+        "入站用户名："+.username, "入站密码："+.password, "分流模式："+.mode' "$STATE_FILE"
+    say '将本机的可达地址、入站端口和账号填入其他机器的 SOCKS5 出站，即可作为其上游。'
     say '请放行云安全组及现有主机防火墙的 TCP 端口；域名分流使用 socks5h / 远程 DNS。'
+    say '使用 socks5-router 呼出菜单（普通用户使用 sudo socks5-router）。'
 }
 
 edit_form() {
-    local selected role force_probe=0 temporary rc=0
+    local selected force_probe=0
+    require_runtime || return 1
     FORM_STATE=$(normalize_state "$STATE_FILE") || return 1
-    role=$(jq -r '.role' <<< "$FORM_STATE")
-    say $'1. 入站账号密码\n2. 监听地址/端口\n3. 来源 IP 白名单'
-    [[ $role != A ]] || say $'4. B 的连接信息\n5. 域名列表\n6. 分流模式'
+    say $'1. 入站账号密码\n2. 监听端口\n3. 来源 IP 白名单\n4. 上游连接信息\n5. 域名列表\n6. 分流模式'
     ask '选择修改项（0 返回）' 0 || return 1
     selected=$REPLY
     case $selected in
         0) return 0;; 1) ask_credentials || return 1;; 2) ask_listener || return 1;; 3) ask_whitelist || return 1;;
-        4) [[ $role == A ]] || return 1; ask_upstream || return 1; force_probe=1;;
-        5) [[ $role == A ]] || return 1; ask_domains || return 1;;
-        6) [[ $role == A ]] || return 1; ask_mode || return 1;; *) error '无效选项。'; return 1;;
+        4)
+            if [[ $(jq -r '.upstream==null' <<< "$FORM_STATE") == true ]]; then
+                say '尚未配置 SOCKS5 出站，将继续选择分流模式并填写上游。'
+                ask_mode 1 || return 1
+            else ask_upstream || return 1; force_probe=1; fi;;
+        5)
+            [[ $(jq -r '.mode' <<< "$FORM_STATE") == domain ]] || {
+                say '域名列表仅用于按域名分流，请先配置出站并选择按域名分流模式。'; return 1;
+            }
+            ask_domains || return 1;;
+        6) ask_mode || return 1;; *) error '无效选项。'; return 1;;
     esac
-    temporary=$(mktemp) || return 1
-    printf '%s\n' "$FORM_STATE" > "$temporary" || { rm -f -- "$temporary"; return 1; }
-    apply_state "$temporary" "$force_probe" || rc=$?
-    rm -f -- "$temporary"
-    (( rc == 0 )) && connection_info
-    return "$rc"
+    submit_form apply_form "$force_probe"
 }
 
 uninstall_service() {
-    [[ -f $STATE_FILE ]] || { error '尚未安装。'; return 1; }
+    require_state || return 1
     say '将删除本工具的服务、配置、凭据备份和安装目录。'
     ask '输入 DELETE 确认卸载' '' || return 1
     [[ $REPLY == DELETE ]] || { say '已取消。'; return 0; }
@@ -474,28 +529,77 @@ deploy_form() {
     local file=$1
     deploy "$file" "${OFFLINE_ARCHIVE:-}" || return 1
     connection_info
-    jq -r '"本次入站密码："+.password' "$STATE_FILE"
+}
+
+apply_form() {
+    local force_probe=${1:-0} file=$2
+    apply_state "$file" "$force_probe" || return 1
+    connection_info
+}
+
+configure_inbound() {
+    if [[ -f $STATE_FILE ]]; then
+        require_runtime || return 1
+        FORM_STATE=$(normalize_state "$STATE_FILE") || return 1
+        ask_credentials && ask_listener && ask_whitelist || return 1
+        submit_form apply_form 0
+    else
+        [[ ! -f $UNIT_FILE ]] || { error '存在服务文件但缺少状态配置，请检查安装目录。'; return 1; }
+        form_new && submit_form deploy_form
+    fi
+}
+
+configure_outbound() {
+    require_runtime || return 1
+    FORM_STATE=$(normalize_state "$STATE_FILE") || return 1
+    ask_mode 1 && submit_form apply_form 0
+}
+
+deployment_menu() {
+    while :; do
+        say $'\nSOCKS5 部署\n1. SOCKS5 入站（部署 / 修改）\n2. SOCKS5 出站及分流（配置 / 修改 / 恢复直连）\n0. 返回'
+        ask '请选择' '' || return 0
+        case $REPLY in
+            0) return 0;;
+            1) configure_inbound || say '入站配置未完成。';;
+            2) require_state || continue; configure_outbound || say '出站配置未完成。';;
+            *) error '无效选项。';;
+        esac
+    done
+}
+
+restore_previous() {
+    require_runtime || return 1
+    [[ -f $PREVIOUS_FILE ]] || { say '暂无上一版配置，成功修改配置后才能恢复。'; return 1; }
+    apply_state "$PREVIOUS_FILE" && connection_info
+}
+
+reapply_current() {
+    require_runtime || return 1
+    apply_state "$STATE_FILE" && connection_info
+}
+
+stop_service() {
+    require_state || return 1
+    service_ctl stop "$SERVICE" && say '服务已停止，开机启动设置保留。'
 }
 
 menu() {
     while :; do
         say $'\n轻量 SOCKS5 管理（Bash / TCP CONNECT）'
-        say $'1. 部署服务器 A\n2. 部署服务器 B\n3. 查看配置（隐藏密码）\n4. 显示账号密码'
-        say $'5. 检查配置及上游认证\n6. 修改配置\n7. 启动/重启\n8. 停止服务'
-        say $'9. 状态和日志\n10. 恢复上一次配置\n11. 重新应用配置\n12. 卸载\n0. 退出'
+        say $'1. SOCKS5 部署（入站 / 出站）\n2. 查看配置及账号密码\n3. 检查配置、上游认证、状态和日志'
+        say $'4. 修改配置\n5. 启动/重启\n6. 停止服务\n7. 恢复上一次配置\n8. 重新应用配置\n9. 卸载\n0. 退出'
+        say '使用 socks5-router 呼出菜单（普通用户使用 sudo socks5-router）。'
         ask '请选择' '' || return 0
+        case $REPLY in 2|3|4|5|6|7|8|9) require_state || continue;; esac
         case $REPLY in
             0) return 0;;
-            1|2)
-                if [[ -f $STATE_FILE || -f $UNIT_FILE ]]; then error '已有服务，请使用修改菜单。'; continue; fi
-                local role=A; [[ $REPLY != 2 ]] || role=B
-                if ! form_new "$role" || ! submit_form deploy_form; then say '部署未完成。'; fi;;
-            3) show_state || :;; 4) show_state 1 || :;; 5) check_state || :;;
-            6) edit_form || say '修改未完成。';; 7) restart_service || :;;
-            8) service_ctl stop "$SERVICE" && say '服务已停止，开机启动设置保留。';;
-            9) service_ctl status --no-pager "$SERVICE" || :; journalctl -u "$SERVICE" -n 40 --no-pager || :;;
-            10) apply_state "$PREVIOUS_FILE" || :;; 11) apply_state "$STATE_FILE" || :;;
-            12) uninstall_service || :;; *) error '无效选项。';;
+            1) deployment_menu;;
+            2) show_state || :;; 3) diagnostics || :;;
+            4) edit_form || say '修改未完成。';; 5) restart_service || :;;
+            6) stop_service || :;; 7) restore_previous || :;; 8) reapply_current || :;;
+            9) if uninstall_service && [[ ! -f $STATE_FILE ]]; then return 0; fi;;
+            *) error '无效选项。';;
         esac
     done
 }
@@ -509,6 +613,7 @@ usage() {
   --version            显示脚本版本
   --help               显示帮助
 默认打开中文交互菜单；validate/render 不安装服务或连接 B。
+安装后使用 socks5-router 呼出菜单（普通用户使用 sudo socks5-router）。
 HELP
 }
 
@@ -540,6 +645,7 @@ main() {
         return $?
     fi
     require_root || return 1
+    if [[ $action == check || $action == show ]]; then require_state || return 1; fi
     ensure_dependencies || return 1
     command -v flock >/dev/null || { error '请先安装 util-linux（flock）。'; return 1; }
     exec 200>"$ROOT_PREFIX/run/socks5-router.lock" || return 1
@@ -547,7 +653,8 @@ main() {
     umask 077
     trap '[[ -z $CURRENT_STAGE ]] || rm -rf -- "$CURRENT_STAGE"' EXIT
     trap 'exit 130' INT TERM
-    case $action in check) check_state;; show) show_state;; *) menu;; esac
+    if [[ $action == menu && -f $STATE_FILE && $RESOURCE_DIR != "$LIB" ]]; then install_manager || return 1; fi
+    case $action in check) diagnostics;; show) show_state;; *) menu;; esac
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

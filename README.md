@@ -20,13 +20,13 @@ flowchart LR
 socks5_installer=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/vatebur/socks5-router/main/install.sh -o "$socks5_installer" && sudo bash "$socks5_installer"; rm -f -- "$socks5_installer"
 ```
 
-**先在 B 选择 `2. 部署服务器 B`，再在 A 选择 `1. 部署服务器 A`。** 安装器会拒绝缺少 Bash 模块的旧发行包。
+选择 `1. SOCKS5 部署（入站 / 出站）`。需要中转时，先在上游机器配置入站，再在中转机器配置入站和出站。安装器会拒绝缺少 Bash 模块的旧发行包。
 
 手动下载参见 [GitHub Releases](https://github.com/vatebur/socks5-router/releases)。
 
 ```bash
 sha256sum -c SHA256SUMS
-tar -xzf socks5-router-v0.2.0.tar.gz
+tar -xzf socks5-router-v0.3.0.tar.gz
 cd socks5-router
 sudo bash socks5.sh
 ```
@@ -47,11 +47,35 @@ sudo bash socks5.sh
 
 普通用户执行 `validate` / `render` 时只检查 jq。若需要自动安装，请使用 sudo。下载一键安装器本身需要服务器已有 curl；手动下载 `install.sh` 后执行 `sudo bash install.sh` 也可自动补齐 curl。
 
-## 服务器 A：入站和出站
+## 灵活部署 SOCKS5 入站与出站
 
-出站使用 B 的实际地址、端口、用户名和密码，脚本不会为 B 自动生成新账号。使用 B 的模式在应用前执行真实 SOCKS5 用户名密码认证；连接失败、认证失败或超时会拒绝新配置。认证检查不代表 B 能访问所有目标网站。
+部署入口参考 [v2ray-agent 的 SOCKS5 入站与出站菜单](https://github.com/mack-a/v2ray-agent/blob/master/install.sh)，统一入口内可分别配置入站、出站，无需选择固定的 A/B 角色。
 
-A 的来源白名单填写客户端的实际出口 IP。云安全组和现有防火墙需放行 A 的 TCP 监听端口。
+### 入站
+
+选择 `1. SOCKS5 部署` → `1. SOCKS5 入站（部署 / 修改）`：
+
+1. 用户名和密码：回车或输入 `auto` 自动生成 UUID，也可手动输入。自动生成的用户名和密码会立即打印到控制台。
+2. 端口：回车或输入 `auto` 自动选择空闲端口，并立即打印；也可手动输入。
+3. 来源白名单：可选配置可信来源 IP / CIDR。
+
+不提供自定义监听 IP 输入。IPv6 启用时使用 `::`，否则使用 `0.0.0.0`；是否同时接受 IPv4/IPv6 连接取决于目标系统的双栈支持。部署后会打印实际监听地址、端口、用户名、密码和菜单引导。
+
+仅配置入站时，全部流量由本机直连，可作为客户端代理或其他机器的上游。已有入站可通过同一入口修改，出站配置会保留。
+
+### 出站与分流
+
+先完成入站，再选择 `1. SOCKS5 部署` → `2. SOCKS5 出站及分流`。入站部署后，可随时添加、修改出站，或恢复直连。
+
+| 模式 | 输入内容 | 访问路径 |
+| --- | --- | --- |
+| `1` 按域名分流 | 上游连接信息、域名列表 | 匹配域名通过上游，其余由本机直连 |
+| `2` 跳过分流 | 无需上游和域名列表 | 清除出站及域名配置，全部由本机直连 |
+| `3` 全局代理 | 上游连接信息 | 全部通过上游，无需域名列表 |
+
+出站使用上游的实际可达地址、端口、用户名和密码，不会自动生成上游账号。启用出站时，应用前执行真实 SOCKS5 用户名密码认证；连接失败、认证失败或超时会拒绝新配置。认证检查不代表上游能访问所有目标网站。
+
+例如：先在服务器 B 配置入站；再在服务器 A 配置入站，并将 B 的连接信息填入 A 的出站。入站白名单填写连接方的实际出口 IP；B 可仅允许 A 的出口 IP。云安全组和现有防火墙需放行各机器的 TCP 入站端口。
 
 ## 来源 IP 限制
 
@@ -88,13 +112,26 @@ curl --proxy socks5h://203.0.113.10:21080 \
 
 ## 日常维护
 
-安装后运行 `sudo socks5-router`。
+使用 `socks5-router` 呼出菜单，普通用户运行 `sudo socks5-router`。
+
+| 菜单 | 功能 |
+| --- | --- |
+| `1` | 部署或修改 SOCKS5 入站、出站和分流 |
+| `2` | 查看完整配置及账号密码 |
+| `3` | 检查配置、上游认证、服务状态和最近 40 条日志 |
+| `4` | 分项修改账号、端口、白名单、上游、域名和分流模式 |
+| `5` / `6` | 启动或重启 / 停止服务 |
+| `7` | 恢复上一次配置 |
+| `8` | 重新应用当前配置 |
+| `9` | 卸载（输入 `DELETE` 确认） |
+
+未配置入站时，查看、检查、修改、启停、恢复和卸载等选项会提示先配置入站。没有上一版备份时，恢复选项会提示需先成功修改一次。综合检查发现配置或认证问题后，仍会显示服务状态和日志。
 
 修改先验证输入、端口和 Xray 配置，再短暂停止服务并原子替换文件。启动失败会恢复旧文件和运行状态；恢复失败则保持停止并报告错误。若系统无法停止候选服务，会保留当前配置并报告错误。
 
-每次成功修改保留一份上一版配置；恢复后可再次切回。停止服务仍保留开机启动设置。同一服务器管理一个实例，切换 A/B 角色需卸载后重装。修改 B 的账号或端口后，还需在 A 同步更新。
+每次成功修改保留一份上一版配置；恢复后可再次切回。停止服务仍保留开机启动设置。同一服务器管理一个实例，入站与出站可分别维护。修改上游入站账号或端口后，还需在连接它的机器同步更新出站。
 
-从旧版本升级时，先备份 `/etc/socks5-router/state.json`，使用旧版本菜单卸载，再安装新版本。
+从 v0.2.0 升级时，运行一键安装命令即可更新管理脚本，保留已有配置。从 v0.1.0 升级时，先备份 `/etc/socks5-router/state.json`，使用旧版本菜单卸载，再安装新版本。
 
 ```bash
 sudo socks5-router check
@@ -153,9 +190,5 @@ bash scripts/build_release.sh
 bash socks5.sh render --state examples/server-a.json --output /tmp/socks5-xray.json
 /absolute/path/to/xray run -test -config /tmp/socks5-xray.json
 ```
-
-真实服务、监听端口和 A/B 网络需在目标服务器验证。
-
-打包产生 `socks5-router-v0.2.0.tar.gz`、`socks5-router.tar.gz` 和 `SHA256SUMS`，上传为同一 GitHub Release 的资产。
 
 功能参考：[mack-a/v2ray-agent](https://github.com/mack-a/v2ray-agent)。核心配置参考 Xray 官方 [SOCKS 入站](https://xtls.github.io/config/inbounds/socks.html)、[SOCKS 出站](https://xtls.github.io/config/outbounds/socks.html)、[路由](https://xtls.github.io/config/routing.html)。

@@ -278,10 +278,10 @@ auth_exchange() {
     local fd=$1 username=$2 password=$3 reply
     printf '\005\001\002' >&"$fd" || return 1
     reply=$(dd bs=1 count=2 status=none <&"$fd" | od -An -tx1 | tr -d ' \n') || return 1
-    [[ $reply == 0502 ]] || { error 'B 未接受 SOCKS5 用户名密码认证。'; return 1; }
+    [[ $reply == 0502 ]] || { error '上游未接受 SOCKS5 用户名密码认证。'; return 1; }
     auth_packet "$username" "$password" >&"$fd" || return 1
     reply=$(dd bs=1 count=2 status=none <&"$fd" | od -An -tx1 | tr -d ' \n') || return 1
-    [[ $reply == 0100 ]] || { error 'B 的 SOCKS5 用户名或密码不匹配。'; return 1; }
+    [[ $reply == 0100 ]] || { error '上游的 SOCKS5 用户名或密码不匹配。'; return 1; }
 }
 
 probe_auth() {
@@ -290,14 +290,14 @@ probe_auth() {
     port=$(jq -r '.upstream.port' "$file") || return 1
     username=$(jq -r '.upstream.username' "$file") || return 1
     password=$(jq -r '.upstream.password' "$file") || return 1
-    exec {fd}<>"/dev/tcp/$host/$port" || { error '无法连接 B。'; return 1; }
+    exec {fd}<>"/dev/tcp/$host/$port" || { error '无法连接上游。'; return 1; }
     auth_exchange "$fd" "$username" "$password" || rc=$?
     exec {fd}>&-
     return "$rc"
 }
 
 verify_upstream() {
-    say '正在核对 B 的 SOCKS5 用户名密码认证……'
+    say '正在核对上游的 SOCKS5 用户名密码认证……'
     timeout --kill-after=2 8 bash "$SCRIPT_PATH" _probe --state "$1" || {
         error '上游认证未通过（连接失败、账号不匹配或超时）。'; return 1;
     }
