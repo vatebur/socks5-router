@@ -5,7 +5,36 @@ REPOSITORY=vatebur/socks5-router
 DEPENDENCY_MANAGER=${DEPENDENCY_MANAGER:-}
 DEPENDENCY_REFRESHED=${DEPENDENCY_REFRESHED:-0}
 
-installer_error() { printf '安装失败：%s\n' "$*" >&2; return 1; }
+# Human-facing output only. Keep redirected logs and machine-readable stdout
+# free of escape sequences, and respect terminals without colour support.
+console_write() {
+    local style=$1 message=$2 fd=${3:-2}
+    if [[ -t $fd && ${TERM:-dumb} != dumb && ! ${NO_COLOR+x} ]]; then
+        printf '\033[%sm%s\033[0m' "$style" "$message" >&"$fd"
+    else printf '%s' "$message" >&"$fd"; fi
+}
+
+console_line() {
+    console_write "$1" "$2" "${3:-2}"
+    printf '\n' >&"${3:-2}"
+}
+
+console_rule() { console_line 90 '────────────────────────────────────────────'; }
+
+console_header() {
+    printf '\n' >&2
+    console_line '1;36' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+    console_line 1 "  $1"
+    [[ -z ${2:-} ]] || console_line 90 "  $2"
+    console_rule
+}
+
+console_item() {
+    console_write '1;36' "  $1) "
+    console_line "${3:-0}" "$2"
+}
+
+installer_error() { console_line '1;31' "安装失败：$*"; return 1; }
 
 # Shared with socks5.sh. Like v2ray-agent's installTools, check tools before
 # downloading missing packages from the distribution's repositories.
@@ -62,7 +91,7 @@ dependency_package() {
 
 dependency_refresh() {
     (( ! DEPENDENCY_REFRESHED )) || return 0
-    printf '正在刷新 %s 软件源……\n' "$DEPENDENCY_MANAGER" >&2
+    console_line 36 "正在刷新 $DEPENDENCY_MANAGER 软件源……"
     case $DEPENDENCY_MANAGER in
         apt-get) apt-get update || return 1;;
         dnf) dnf makecache || return 1;;
@@ -78,7 +107,7 @@ ensure_tools() {
         dependency_ready "$tool" || missing+=("$tool")
     done
     (( ${#missing[@]} )) || return 0
-    printf '需要安装或更新的依赖：%s\n' "${missing[*]}" >&2
+    console_line 33 "需要安装或更新的依赖：${missing[*]}"
     (( EUID == 0 )) || { installer_error '自动安装依赖需要 root，请使用 sudo 或手动安装上述工具。'; return 1; }
     dependency_manager || return 1
     for tool in "${missing[@]}"; do
@@ -88,13 +117,13 @@ ensure_tools() {
     # CentOS may provide jq through EPEL, as in the reference installTools.
     if [[ $DEPENDENCY_MANAGER != apt-get && -f /etc/centos-release && " ${packages[*]} " == *' jq '* ]]; then
         if ! rpm -q epel-release >/dev/null 2>&1; then
-            printf '正在安装 CentOS EPEL 软件源……\n' >&2
+            console_line 36 '正在安装 CentOS EPEL 软件源……'
             "$DEPENDENCY_MANAGER" install -y epel-release || { installer_error 'EPEL 软件源安装失败。'; return 1; }
             DEPENDENCY_REFRESHED=0
         fi
     fi
     dependency_refresh || { installer_error '软件源刷新失败，请检查网络及软件源配置。'; return 1; }
-    printf '正在下载并安装软件包：%s\n' "${packages[*]}" >&2
+    console_line 36 "正在下载并安装软件包：${packages[*]}"
     if [[ $DEPENDENCY_MANAGER == apt-get ]]; then
         DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" || {
             installer_error '依赖安装失败，请检查包管理器输出。'; return 1;
@@ -112,7 +141,7 @@ ensure_tools() {
             return 1
         fi
     done
-    printf '依赖检查通过。\n' >&2
+    console_line 32 '依赖检查通过。'
 }
 
 bootstrap_tools() { ensure_tools curl jq tar sha256sum awk mktemp ca-certificates; }
@@ -145,7 +174,7 @@ download_release() {
         "https://api.github.com/repos/$REPOSITORY/releases/latest" -o "$stage/release.json" || return 1
     metadata=$(release_metadata "$stage/release.json") || return 1
     IFS=$'\t' read -r name package_url checksum_url <<< "$metadata"
-    printf '正在下载 %s……\n' "$name" >&2
+    console_line 36 "正在下载 $name……"
     curl -fSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 300 --retry 2 \
         "$package_url" -o "$stage/package.tar.gz" || return 1
     curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \

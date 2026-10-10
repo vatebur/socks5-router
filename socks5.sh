@@ -43,7 +43,7 @@ reset_failed_service() {
 
 require_state() {
     [[ -f $STATE_FILE ]] || {
-        say '尚未配置 SOCKS5，请先选择「1. SOCKS5 部署」安装入站或出站。'
+        warn '尚未配置 SOCKS5，请先选择「1. SOCKS5 部署」安装入站或出站。'
         return 1
     }
 }
@@ -53,12 +53,12 @@ outbound_installed() { [[ -f $STATE_FILE ]] && jq -e '.upstream!=null' "$STATE_F
 
 require_inbound() {
     require_state || return 1
-    inbound_installed || { say '尚未安装 SOCKS5 入站，请先通过部署菜单安装入站。'; return 1; }
+    inbound_installed || { warn '尚未安装 SOCKS5 入站，请先通过部署菜单安装入站。'; return 1; }
 }
 
 require_outbound() {
     require_state || return 1
-    outbound_installed || { say '尚未安装 SOCKS5 出站，请先通过部署菜单安装出站及分流。'; return 1; }
+    outbound_installed || { warn '尚未安装 SOCKS5 出站，请先通过部署菜单安装出站及分流。'; return 1; }
 }
 
 require_runtime() {
@@ -249,7 +249,7 @@ apply_rollback() {
         service_ctl stop "$SERVICE" || :
         error '恢复旧配置也发生错误，服务保持停止，请检查文件与 systemd。'; return 1
     fi
-    say '应用失败，已恢复之前的配置和运行状态。'
+    warn '应用失败，已恢复之前的配置和运行状态。'
 }
 
 apply_state() {
@@ -280,8 +280,8 @@ apply_state() {
         rm -rf -- "$stage"; CURRENT_STAGE=; return 1
     fi
     if apply_commit "$stage"; then
-        if [[ $enabled == true ]]; then say '配置已生效，服务已设置为开机启动。';
-        else say '配置已保存；未安装入站，服务保持停止并关闭开机启动。'; fi
+        if [[ $enabled == true ]]; then success '配置已生效，服务已设置为开机启动。';
+        else success '配置已保存；未安装入站，服务保持停止并关闭开机启动。'; fi
     else
         result=1
         APPLY_CANCELLED=0
@@ -318,15 +318,15 @@ check_state() {
     require_runtime || return 1
     expected=$(render_config "$STATE_FILE" | jq -cS .) || return 1
     if actual=$(jq -cS . "$CONFIG_FILE") && [[ $expected == "$actual" ]]; then
-        say '[通过] 状态文件、入站、出站、分流和来源 IP 路由规则。'
+        console_line 32 '[通过] 状态文件、入站、出站、分流和来源 IP 路由规则。'
     else error 'state.json 与 config.json 无法读取或不一致，请通过修改配置菜单修正。'; failed=1; fi
     "$XRAY" run -test -config "$CONFIG_FILE" || failed=1
     if inbound_installed; then
-        if service_active; then say '[通过] systemd 服务运行中。'
+        if service_active; then console_line 32 '[通过] systemd 服务运行中。'
         else error '服务当前未运行。'; failed=1; fi
-    else say '[提示] 未安装入站，服务保持停止。'; fi
+    else warn '未安装入站，服务保持停止。'; fi
     if [[ $(jq -r '.mode' "$STATE_FILE") != direct ]]; then
-        if verify_upstream "$STATE_FILE"; then say '[通过] 上游接受当前账号密码。'
+        if verify_upstream "$STATE_FILE"; then console_line 32 '[通过] 上游接受当前账号密码。'
         else failed=1; fi
     fi
     return "$failed"
@@ -335,11 +335,11 @@ check_state() {
 diagnostics() {
     local failed=0
     require_state || return 1
-    say '=== 配置检查与上游认证 ==='
+    console_header '配置检查与上游认证'
     check_state || failed=1
-    say '=== 服务状态 ==='
+    console_header '服务状态'
     if ! service_ctl status --no-pager "$SERVICE"; then inbound_installed && failed=1; fi
-    say '=== 最近 40 条日志 ==='
+    console_header '最近 40 条日志'
     journalctl -u "$SERVICE" -n 40 --no-pager || failed=1
     return "$failed"
 }
@@ -356,10 +356,14 @@ restart_service() {
 
 ask() {
     local prompt=$1 default=${2:-} secret=${3:-0}
-    if (( secret )); then
-        if [[ -t 0 ]]; then read -rs -p "$prompt：" REPLY || return 1; printf '\n' >&2;
-        else read -r -p "$prompt：" REPLY || return 1; fi
-    else read -r -p "$prompt${default:+ [$default]}：" REPLY || return 1; fi
+    if [[ -t 0 ]]; then
+        if (( secret )); then console_write '1;36' "  › $prompt：";
+        else console_write '1;36' "  › $prompt${default:+ [$default]}："; fi
+    fi
+    if (( secret )) && [[ -t 0 ]]; then
+        read -rs REPLY || return 1
+        printf '\n' >&2
+    else read -r REPLY || return 1; fi
     [[ -n $REPLY ]] || REPLY=$default
 }
 
@@ -484,7 +488,10 @@ ask_domains() {
 ask_mode() {
     local configure_upstream=${1:-0} default=1 mode
     case $(jq -r '.mode' <<< "$FORM_STATE") in direct) default=2;; global) default=3;; esac
-    say '1. 按域名分流   2. 跳过分流（全部直连）   3. 全局代理（全部通过上游）'
+    console_header '选择分流模式'
+    console_item 1 '按域名分流'
+    console_item 2 '跳过分流（全部直连）'
+    console_item 3 '全局代理（全部通过上游）'
     while :; do
         ask '分流模式' "$default" || return 1
         case $REPLY in 1) mode=domain;; 2) mode=direct;; 3) mode=global;; *) error '请选择 1/2/3。'; continue;; esac
@@ -520,25 +527,40 @@ submit_form() {
 }
 
 connection_info() {
-    normalize_state "$STATE_FILE" | jq -r '
+    local details line
+    details=$(normalize_state "$STATE_FILE" | jq -r '
         if .inbound_enabled then
           "SOCKS5 入站：" + (if .listen|contains(":") then "["+.listen+"]" else .listen end) + ":" + (.port|tostring),
           "入站用户名："+.username, "入站密码："+.password
         else "SOCKS5 入站：未安装" end,
         (if .upstream==null then "SOCKS5 出站：未安装" else "SOCKS5 出站："+.upstream.host+":"+(.upstream.port|tostring) end),
-        "分流模式："+.mode'
+        "分流模式："+(if .mode=="direct" then "全部直连（direct）"
+          elif .mode=="domain" then "按域名分流（domain）" else "全局代理（global）" end)') || return 1
+    console_header '连接信息' 'SOCKS5 入站 / 出站 / 分流配置'
+    while IFS= read -r line; do
+        case $line in
+            *未安装) console_line 33 "  $line" 1;;
+            入站用户名：*|入站密码：*) console_line '1;32' "  $line" 1;;
+            *) console_line 36 "  $line" 1;;
+        esac
+    done <<< "$details"
+    console_rule
     if inbound_installed; then
         say '将本机的可达地址、入站端口和账号填入其他机器的 SOCKS5 出站，即可作为其上游。'
-        say '请放行云安全组及现有主机防火墙的 TCP 端口；域名分流使用 socks5h / 远程 DNS。'
+        warn '请放行云安全组及现有主机防火墙的 TCP 端口；域名分流使用 socks5h / 远程 DNS。'
     fi
-    say '使用 socks5-router 呼出菜单（普通用户使用 sudo socks5-router）。'
+    hint '使用 socks5-router 呼出菜单（普通用户使用 sudo socks5-router）。'
 }
 
 edit_inbound() {
     local selected
     require_inbound && require_runtime || return 1
     FORM_STATE=$(normalize_state "$STATE_FILE") || return 1
-    say $'1. 入站账号密码\n2. 监听端口\n3. 来源 IP 白名单\n0. 返回'
+    console_header '修改 SOCKS5 入站配置'
+    console_item 1 '入站账号密码'
+    console_item 2 '监听端口'
+    console_item 3 '来源 IP 白名单'
+    console_item 0 '返回' 90
     ask '选择入站修改项' 0 || return 1
     selected=$REPLY
     case $selected in
@@ -552,14 +574,18 @@ edit_outbound() {
     local selected force_probe=0
     require_outbound && require_runtime || return 1
     FORM_STATE=$(normalize_state "$STATE_FILE") || return 1
-    say $'1. 上游连接信息\n2. 域名列表\n3. 分流模式\n0. 返回'
+    console_header '修改 SOCKS5 出站配置'
+    console_item 1 '上游连接信息'
+    console_item 2 '域名列表'
+    console_item 3 '分流模式'
+    console_item 0 '返回' 90
     ask '选择出站修改项' 0 || return 1
     selected=$REPLY
     case $selected in
         0) return 0;; 1) ask_upstream || return 1; force_probe=1;;
         2)
             [[ $(jq -r '.mode' <<< "$FORM_STATE") == domain ]] || {
-                say '域名列表仅用于按域名分流，请先配置出站并选择按域名分流模式。'; return 1;
+                warn '域名列表仅用于按域名分流，请先配置出站并选择按域名分流模式。'; return 1;
             }
             ask_domains || return 1;;
         3) ask_mode || return 1;; *) error '无效选项。'; return 1;;
@@ -569,11 +595,14 @@ edit_outbound() {
 
 edit_menu() {
     while :; do
-        say $'\n修改配置\n1. 修改 SOCKS5 入站配置\n2. 修改 SOCKS5 出站配置\n0. 返回'
+        console_header '修改配置'
+        console_item 1 '修改 SOCKS5 入站配置'
+        console_item 2 '修改 SOCKS5 出站配置'
+        console_item 0 '返回' 90
         ask '请选择' '' || return 0
         case $REPLY in
-            0) return 0;; 1) edit_inbound || say '入站修改未完成。';;
-            2) edit_outbound || say '出站修改未完成。';; *) error '无效选项。';;
+            0) return 0;; 1) edit_inbound || failure '入站修改未完成。';;
+            2) edit_outbound || failure '出站修改未完成。';; *) failure '无效选项。';;
         esac
     done
 }
@@ -581,9 +610,9 @@ edit_menu() {
 uninstall_service() {
     local load_state uid gid directory
     UNINSTALL_COMPLETED=0
-    say '将彻底删除 SOCKS5 服务、核心、管理脚本、全部配置及专用系统账号和用户组。'
+    warn '将彻底删除 SOCKS5 服务、核心、管理脚本、全部配置及专用系统账号和用户组。'
     ask '输入 DELETE 确认卸载' '' || return 1
-    [[ $REPLY == DELETE ]] || { say '已取消。'; return 0; }
+    [[ $REPLY == DELETE ]] || { hint '已取消。'; return 0; }
     load_state=$(service_ctl show --property=LoadState --value "$SERVICE") || {
         error '无法检查 systemd 服务状态，卸载未完成。'; return 1;
     }
@@ -612,7 +641,7 @@ uninstall_service() {
     service_ctl daemon-reload || return 1
     rm -f -- "$LOCK_FILE" || return 1
     UNINSTALL_COMPLETED=1
-    say '已彻底卸载：服务、程序、配置、锁文件及专用系统账号和用户组均已清理。'
+    success '已彻底卸载：服务、程序、配置、锁文件及专用系统账号和用户组均已清理。'
 }
 
 deploy_form() {
@@ -628,7 +657,7 @@ apply_form() {
 }
 
 configure_inbound() {
-    if inbound_installed; then say '入站已安装，请通过「修改配置」→「修改 SOCKS5 入站配置」进行修改。'; return 0; fi
+    if inbound_installed; then warn '入站已安装，请通过「修改配置」→「修改 SOCKS5 入站配置」进行修改。'; return 0; fi
     if [[ -f $STATE_FILE ]]; then
         require_runtime || return 1
         FORM_STATE=$(normalize_state "$STATE_FILE") || return 1
@@ -642,20 +671,20 @@ configure_inbound() {
 }
 
 configure_outbound() {
-    if outbound_installed; then say '出站已安装，请通过「修改配置」→「修改 SOCKS5 出站配置」进行修改。'; return 0; fi
+    if outbound_installed; then warn '出站已安装，请通过「修改配置」→「修改 SOCKS5 出站配置」进行修改。'; return 0; fi
     if [[ -f $STATE_FILE ]]; then
         require_runtime || return 1
         FORM_STATE=$(normalize_state "$STATE_FILE") || return 1
     else form_new || return 1; fi
     ask_mode 1 || return 1
-    [[ $(jq -r '.upstream!=null' <<< "$FORM_STATE") == true ]] || { say '选择了全部直连，未安装 SOCKS5 出站。'; return 0; }
+    [[ $(jq -r '.upstream!=null' <<< "$FORM_STATE") == true ]] || { warn '选择了全部直连，未安装 SOCKS5 出站。'; return 0; }
     if [[ -f $STATE_FILE ]]; then submit_form apply_form 1; else submit_form deploy_form; fi
 }
 
 remove_inbound() {
     require_inbound && require_runtime || return 1
     ask '卸载 SOCKS5 入站并清除监听账号？y/n' n || return 1
-    [[ $REPLY == y || $REPLY == Y ]] || { say '已取消。'; return 0; }
+    [[ $REPLY == y || $REPLY == Y ]] || { hint '已取消。'; return 0; }
     FORM_STATE=$(normalize_state "$STATE_FILE") || return 1
     FORM_STATE=$(jq '.inbound_enabled=false|.port=null|.username=""|.password=""|.whitelist=[]' <<< "$FORM_STATE") || return 1
     submit_form apply_form 0
@@ -664,7 +693,7 @@ remove_inbound() {
 remove_outbound() {
     require_outbound && require_runtime || return 1
     ask '卸载 SOCKS5 出站及分流？y/n' n || return 1
-    [[ $REPLY == y || $REPLY == Y ]] || { say '已取消。'; return 0; }
+    [[ $REPLY == y || $REPLY == Y ]] || { hint '已取消。'; return 0; }
     FORM_STATE=$(normalize_state "$STATE_FILE") || return 1
     FORM_STATE=$(jq '.upstream=null|.domains=[]|.mode="direct"|.role="B"' <<< "$FORM_STATE") || return 1
     submit_form apply_form 0
@@ -672,29 +701,45 @@ remove_outbound() {
 
 deployment_menu() {
     while :; do
-        say $'\nSOCKS5 部署\n1. 安装 SOCKS5 入站\n2. 安装 SOCKS5 出站及分流\n3. 卸载 SOCKS5 入站\n4. 卸载 SOCKS5 出站及分流\n0. 返回'
+        console_header 'SOCKS5 部署'
+        console_item 1 '安装 SOCKS5 入站'
+        console_item 2 '安装 SOCKS5 出站及分流'
+        console_rule
+        console_item 3 '卸载 SOCKS5 入站' 33
+        console_item 4 '卸载 SOCKS5 出站及分流' 33
+        console_item 0 '返回' 90
         ask '请选择' '' || return 0
         case $REPLY in
             0) return 0;;
-            1) configure_inbound || say '入站配置未完成。';;
-            2) configure_outbound || say '出站配置未完成。';;
-            3) remove_inbound || say '入站卸载未完成。';;
-            4) remove_outbound || say '出站卸载未完成。';;
-            *) error '无效选项。';;
+            1) configure_inbound || failure '入站配置未完成。';;
+            2) configure_outbound || failure '出站配置未完成。';;
+            3) remove_inbound || failure '入站卸载未完成。';;
+            4) remove_outbound || failure '出站卸载未完成。';;
+            *) failure '无效选项。';;
         esac
     done
 }
 
 stop_service() {
     require_state || return 1
-    service_ctl stop "$SERVICE" && say '服务已停止，开机启动设置保留。'
+    service_ctl stop "$SERVICE" && success '服务已停止，开机启动设置保留。'
 }
 
 service_menu() {
     while :; do
-        say $'\n服务管理\n1. 启动/重启服务\n2. 停止服务\n0. 返回'
+        console_header '服务管理'
+        console_item 1 '启动/重启服务'
+        console_item 2 '停止服务' 33
+        console_item 0 '返回' 90
         ask '请选择' '' || return 0
-        case $REPLY in 0) return 0;; 1) restart_service || :;; 2) stop_service || :;; *) error '无效选项。';; esac
+        case $REPLY in
+            0) return 0;;
+            1)
+                if restart_service; then success '服务已启动。';
+                else failure '服务启动未完成，请检查上述错误。'; fi;;
+            2) stop_service || failure '服务停止未完成，请检查上述错误。';;
+            *) failure '无效选项。';;
+        esac
     done
 }
 
@@ -741,8 +786,8 @@ upgrade_manager() {
     candidate="$stage/socks5-router"
     latest=$(bash "$candidate/socks5.sh" --version) || { rm -rf -- "$stage"; CURRENT_STAGE=; return 1; }
     if ! version_newer "$latest" "$VERSION"; then
-        if [[ $latest == "$VERSION" ]]; then say "已是最新版本：$VERSION";
-        elif [[ $latest =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$ ]]; then say "当前版本 $VERSION 高于稳定发行版 $latest，无需升级。";
+        if [[ $latest == "$VERSION" ]]; then success "已是最新版本：$VERSION";
+        elif [[ $latest =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$ ]]; then hint "当前版本 $VERSION 高于稳定发行版 $latest，无需升级。";
         else rm -rf -- "$stage"; CURRENT_STAGE=; error '发行包版本号无效。'; return 1; fi
         rm -rf -- "$stage"; CURRENT_STAGE=; return 0
     fi
@@ -762,18 +807,26 @@ upgrade_manager() {
     rm -rf -- "$stage"; CURRENT_STAGE=
     if (( rc == 0 )); then
         UPGRADE_COMPLETED=1
-        say "已升级到 $latest，当前配置和服务运行状态保留。"
-        say '使用 socks5-router 呼出新版菜单（普通用户使用 sudo socks5-router）。'
+        success "已升级到 $latest，当前配置和服务运行状态保留。"
+        hint '使用 socks5-router 呼出新版菜单（普通用户使用 sudo socks5-router）。'
     fi
     return "$rc"
 }
 
 menu() {
     while :; do
-        say $'\n轻量 SOCKS5 管理（Bash / TCP CONNECT）'
-        say $'1. SOCKS5 部署（入站 / 出站）\n2. 查看配置及账号密码\n3. 检查配置、上游认证、状态和日志'
-        say $'4. 修改配置\n5. 服务管理\n6. 升级\n7. 卸载全部\n0. 退出'
-        say '使用 socks5-router 呼出菜单（普通用户使用 sudo socks5-router）。'
+        console_header '轻量 SOCKS5 管理' "v$VERSION · Xray ${XRAY_VERSION#v} · TCP CONNECT"
+        console_item 1 'SOCKS5 部署（入站 / 出站）'
+        console_item 2 '查看配置及账号密码'
+        console_item 3 '检查配置、上游认证、状态和日志'
+        console_item 4 '修改配置'
+        console_item 5 '服务管理'
+        console_item 6 '升级'
+        console_rule
+        console_item 7 '卸载全部' '1;31'
+        console_item 0 '退出' 90
+        console_rule
+        hint '使用 socks5-router 呼出菜单（普通用户使用 sudo socks5-router）。'
         ask '请选择' '' || return 0
         case $REPLY in 2|3|4|5) require_state || continue;; esac
         case $REPLY in
@@ -781,9 +834,9 @@ menu() {
             1) deployment_menu;;
             2) show_state || :;; 3) diagnostics || :;;
             4) edit_menu;; 5) service_menu;;
-            6) upgrade_manager || say '升级未完成。'; (( UPGRADE_COMPLETED == 0 )) || return 0;;
-            7) uninstall_service || say '卸载未完成，请检查上述错误后重试。'; (( UNINSTALL_COMPLETED == 0 )) || return 0;;
-            *) error '无效选项。';;
+            6) upgrade_manager || failure '升级未完成。'; (( UPGRADE_COMPLETED == 0 )) || return 0;;
+            7) uninstall_service || failure '卸载未完成，请检查上述错误后重试。'; (( UNINSTALL_COMPLETED == 0 )) || return 0;;
+            *) failure '无效选项。';;
         esac
     done
 }
@@ -819,11 +872,11 @@ main() {
     if [[ $action == validate || $action == render ]]; then
         ensure_jq || return 1
         [[ -n $state ]] || { error '必须指定 --state FILE。'; return 1; }
-        if [[ $action == validate ]]; then normalize_state "$state" >/dev/null && say '状态配置校验通过。';
+        if [[ $action == validate ]]; then normalize_state "$state" >/dev/null && success '状态配置校验通过。';
         elif [[ -z $output ]]; then render_config "$state";
         else
             temporary=$(mktemp "$(dirname -- "$output")/.render.XXXXXX") || return 1
-            if render_config "$state" > "$temporary" && chmod 600 "$temporary" && mv -f -- "$temporary" "$output"; then say "已生成 $output";
+            if render_config "$state" > "$temporary" && chmod 600 "$temporary" && mv -f -- "$temporary" "$output"; then success "已生成 $output";
             else rm -f -- "$temporary"; return 1; fi
         fi
         return $?

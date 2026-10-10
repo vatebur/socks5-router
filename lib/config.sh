@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # Configuration helpers. All JSON values pass through jq, never text interpolation.
 
-error() { printf '错误：%s\n' "$*" >&2; return 1; }
-say() { printf '%s\n' "$*" >&2; }
+# install.sh also supplies these helpers to the standalone download installer.
+say() { console_line 36 "$*"; }
+success() { console_line 32 "[成功] $*"; }
+warn() { console_line 33 "[提示] $*"; }
+hint() { console_line 90 "$*"; }
+failure() { console_line '1;31' "错误：$*"; }
+error() { failure "$@"; return 1; }
 
 trim() {
     local text=$1

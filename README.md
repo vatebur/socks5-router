@@ -127,6 +127,8 @@ curl --proxy socks5h://203.0.113.10:21080 \
 
 首次打开菜单时就会安装管理命令；即使暂未配置入站/出站或核心下载失败，也能用该命令重新进入菜单。命令入口丢失时，运行 `sudo bash /home/socks/socks5.sh`（请替换为实际源码路径）即可重新安装入口。
 
+终端菜单使用彩色标题与分组：错误为红色，成功为绿色，提醒为黄色，普通信息为青色。输出重定向或 `TERM=dumb` 时自动关闭颜色；设置 `NO_COLOR=1` 也可关闭颜色。`show` / `render` 的 JSON 输出保持原有格式。
+
 版本更新记录见 [GitHub Releases](https://github.com/vatebur/socks5-router/releases)。
 
 | 菜单 | 功能 |
