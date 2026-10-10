@@ -80,7 +80,7 @@ prepare_dirs() {
 
 install_manager() {
     local path
-    install -d -m 755 "$LIB/lib" "$LIB/templates" || return 1
+    install -d -m 755 "$LIB/lib" "$LIB/templates" "$(dirname -- "$COMMAND_FILE")" || return 1
     for path in socks5.sh install.sh lib/config.sh templates/xray.json templates/render.jq; do
         if [[ "$RESOURCE_DIR/$path" != "$LIB/$path" ]]; then
             install -m 644 -- "$RESOURCE_DIR/$path" "$LIB/$path" || return 1
@@ -89,7 +89,7 @@ install_manager() {
     chmod 755 "$LIB/socks5.sh" || return 1
     local wrapper
     wrapper=$(mktemp "$(dirname -- "$COMMAND_FILE")/.socks5-router.XXXXXX") || return 1
-    printf '#!/usr/bin/env bash\nexec bash /usr/local/lib/socks5-router/socks5.sh "$@"\n' > "$wrapper" || { rm -f -- "$wrapper"; return 1; }
+    printf '#!/usr/bin/env bash\nexec bash %q "$@"\n' "$LIB/socks5.sh" > "$wrapper" || { rm -f -- "$wrapper"; return 1; }
     if ! { chmod 755 "$wrapper" && mv -f -- "$wrapper" "$COMMAND_FILE"; }; then
         rm -f -- "$wrapper"; return 1
     fi
@@ -289,7 +289,10 @@ deploy() {
     [[ ! -f $STATE_FILE && ! -f $UNIT_FILE ]] || { error '已有服务，请通过菜单修改或先卸载。'; return 1; }
     [[ $(uname -s) == Linux && -d /run/systemd/system ]] || { error '需要使用 systemd 的 Linux 服务器。'; return 1; }
     normalize_state "$state" >/dev/null || return 1
-    ensure_dependencies && prepare_dirs && install_core "$archive" && install_manager || return 1
+    ensure_dependencies || { error '部署依赖检查失败，请检查上述依赖或软件源错误。'; return 1; }
+    prepare_dirs || { error '创建服务账号或安装目录失败，请检查上述权限错误。'; return 1; }
+    install_manager || { error '安装管理脚本及 socks5-router 命令失败。'; return 1; }
+    install_core "$archive" || { error '安装 Xray 核心失败，请检查下载、SHA256 校验或核心版本。'; return 1; }
     if jq -e '.upstream!=null' "$state" >/dev/null; then apply_state "$state" 1;
     else apply_state "$state"; fi
 }
@@ -825,7 +828,9 @@ main() {
     umask 077
     trap '[[ -z $CURRENT_STAGE ]] || rm -rf -- "$CURRENT_STAGE"' EXIT
     trap 'exit 130' INT TERM
-    if [[ $action == menu && -f $STATE_FILE && $RESOURCE_DIR != "$LIB" ]]; then install_manager || return 1; fi
+    # Keep the menu available even before a first deployment succeeds, including
+    # when this script was launched from the installer's temporary directory.
+    if [[ $action == menu ]]; then install_manager || return 1; fi
     case $action in check) diagnostics;; show) show_state;; upgrade) upgrade_manager;; *) menu;; esac
 }
 

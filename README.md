@@ -125,6 +125,8 @@ curl --proxy socks5h://203.0.113.10:21080 \
 
 使用 `socks5-router` 呼出菜单，普通用户运行 `sudo socks5-router`。
 
+首次打开菜单时就会安装管理命令；即使暂未配置入站/出站或核心下载失败，也能用该命令重新进入菜单。命令入口丢失时，运行 `sudo bash /home/socks/socks5.sh`（请替换为实际源码路径）即可重新安装入口。
+
 版本更新记录见 [GitHub Releases](https://github.com/vatebur/socks5-router/releases)。
 
 | 菜单 | 功能 |
