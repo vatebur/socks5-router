@@ -30,11 +30,13 @@
 
 ## 彻底卸载
 
-选择 `7. 卸载全部`，输入 `DELETE` 确认。脚本停止并禁用服务，删除 systemd 服务文件、开机启动链接及服务专用配置目录，清除 `/etc/socks5-router/`、`/usr/local/lib/socks5-router/`、`/usr/local/bin/socks5-router` 和 `/run/socks5-router.lock`，并删除 `socks5-router` 专用无登录系统账号及同名用户组。核心、全部凭据和旧配置备份随专用目录一起删除。
+选择 `7. 卸载全部`，输入 `DELETE` 确认。脚本停止并禁用服务，删除 systemd 服务文件、开机启动链接及服务专用配置目录，清除 `/etc/socks5-router/`、`/usr/local/lib/socks5-router/`、`/usr/local/bin/socks5-router` 和 `/run/socks5-router.lock`，并删除 `socks5-router` 专用无登录系统账号及同名用户组。核心和全部配置及凭据随专用目录一起删除。
 
 没有 `state.json` 或安装中途失败时，也可使用此入口清理残留。删除失败会报告错误，不会提示卸载成功；修正后可再次运行卸载。
 
 ## 升级
+
+从尚未拆分 `lib/` 模块的旧安装迁移时，先重新运行一键安装命令，或在完整的新源码/发行包目录运行 `sudo bash socks5.sh`。进入菜单即会安装全部管理模块，已有状态、运行配置和 Xray 核心保留。旧版升级器只复制原有文件，不能通过旧版 `upgrade` 命令完成新增模块的安装；补齐模块后再使用升级菜单。
 
 选择 `6. 升级`，或执行 `sudo socks5-router upgrade`。升级器从 GitHub 下载最新稳定版安装包与 SHA256SUMS，校验后检查新版本能否读取现有配置、是否通过当前 Xray 核心检查，以及生成的运行配置是否一致。通过后更新管理脚本与 JSON 模板，保留配置、凭据、端口及服务运行状态；完成后使用 `socks5-router` 呼出新版菜单。
 

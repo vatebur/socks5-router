@@ -190,6 +190,9 @@ download_release() {
        -f $stage/socks5-router/templates/render.jq ]] || {
         installer_error '最新发行版尚未包含 Bash 版本，请先发布 v0.2.0 或更新版本。'; return 1;
     }
+    bash "$stage/socks5-router/socks5.sh" --version >/dev/null || {
+        installer_error '发行包管理入口或依赖模块不完整。'; return 1;
+    }
 }
 
 installer_main() {

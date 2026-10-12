@@ -41,6 +41,8 @@ flowchart LR
 | Xray | SOCKS5 TCP CONNECT、账号认证、来源限制与分流 |
 | systemd | 管理服务进程与开机启动 |
 
+源码按职责拆分到 `lib/`，根目录保留安装与管理入口，目录及模块说明见[开发文档](development.md#项目目录)。
+
 配置应用前检查输入、端口和 Xray 配置，通过后原子替换文件。启动失败时恢复旧配置与运行状态。系统防火墙与云安全组由用户自行管理。
 
 核心配置参考 Xray 官方 [SOCKS 入站](https://xtls.github.io/config/inbounds/socks.html)、[SOCKS 出站](https://xtls.github.io/config/outbounds/socks.html)和[路由](https://xtls.github.io/config/routing.html)。
