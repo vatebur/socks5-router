@@ -6,7 +6,7 @@ if (( BASH_VERSINFO[0] < 4 )); then printf '%s\n' '需要 Bash 4 或更高版本
 SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
 RESOURCE_DIR=$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
 
-VERSION=0.4.1
+VERSION=0.4.2
 SERVICE=socks5-router.service
 ACCOUNT=socks5-router
 ROOT_PREFIX=${SOCKS5_ROUTER_ROOT:-}
